@@ -36,13 +36,12 @@ endif
 $(SUBDIR)$(LIBNAME): $(OBJS) $(STLIBOBJS)
 	$(RM) $@
 ifeq ($(RESPONSE_FILES),yes)
-	$(Q)echo $^ > $@.objs
+	$(file >$@.objs,$^)
 	$(AR) $(ARFLAGS) $(AR_O) @$@.objs
 else
 	$(AR) $(ARFLAGS) $(AR_O) $^
 endif
 	$(RANLIB) $@
-	-$(RM) $@.objs
 
 install-headers: install-lib$(NAME)-headers install-lib$(NAME)-pkgconfig
 
@@ -77,13 +76,15 @@ $(SUBDIR)$(SLIBNAME): $(SUBDIR)$(SLIBNAME_WITH_MAJOR)
 $(SUBDIR)$(SLIBNAME_WITH_MAJOR): $(OBJS) $(SHLIBOBJS) $(SUBDIR)lib$(NAME).ver
 	$(SLIB_CREATE_DEF_CMD)
 ifeq ($(RESPONSE_FILES),yes)
-	$(Q)echo $$(filter %.o,$$^) > $$@.objs
+	echo L80
+	$(file >$$@.objs,$$(filter %.o,$$^))
+	echo L81
+#	echo $$(filter %.o,$$^) > $$@.objs
 	$$(call LINK,$$(call $(NAME)LINK_SO_ARGS) $$(LD_O) @$$@.objs $$(call $(NAME)LINK_EXTRA))
 else
 	$$(call LINK,$$(call $(NAME)LINK_SO_ARGS) $$(LD_O) $$(filter %.o,$$^) $$(call $(NAME)LINK_EXTRA))
 endif
 	$(SLIB_EXTRA_CMD)
-	-$(RM) $$@.objs
 
 ifdef SUBDIR
 $(SUBDIR)$(SLIBNAME_WITH_MAJOR): $(DEP_LIBS)

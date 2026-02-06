@@ -555,6 +555,7 @@ extern const FFFilter ff_vf_yaepblur;
 extern const FFFilter ff_vf_zmq;
 extern const FFFilter ff_vf_zoompan;
 extern const FFFilter ff_vf_zscale;
+extern const FFFilter ff_vf_ioplaying;
 extern const FFFilter ff_vf_hstack_vaapi;
 extern const FFFilter ff_vf_vstack_vaapi;
 extern const FFFilter ff_vf_xstack_vaapi;

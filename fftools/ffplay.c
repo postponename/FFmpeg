@@ -51,6 +51,7 @@
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersink.h"
 #include "libavfilter/buffersrc.h"
+#include "ioplaying_sdlside.h"
 
 #include <SDL.h>
 #include <SDL_thread.h>
@@ -199,6 +200,7 @@ typedef struct Decoder {
     SDL_Thread *decoder_tid;
 } Decoder;
 
+
 typedef struct VideoState {
     SDL_Thread *read_tid;
     const AVInputFormat *iformat;
@@ -301,6 +303,8 @@ typedef struct VideoState {
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
     SDL_cond *continue_read_thread;
+	
+	EventWarpper event_warpper;
 } VideoState;
 
 /* options specified by the user */
@@ -1340,6 +1344,8 @@ static void stream_close(VideoState *is)
         SDL_DestroyTexture(is->vid_texture);
     if (is->sub_texture)
         SDL_DestroyTexture(is->sub_texture);
+    
+    event_warpper_uninit(&is->event_warpper);
     av_free(is);
 }
 
@@ -2233,7 +2239,7 @@ static int video_thread(void *arg)
 
     if (!frame)
         return AVERROR(ENOMEM);
-
+	
     for (;;) {
         ret = get_video_frame(is, frame);
         if (ret < 0)
@@ -2276,6 +2282,8 @@ static int video_thread(void *arg)
             frame_rate = av_buffersink_get_frame_rate(filt_out);
         }
 
+		fill_ioplaying(&is->event_warpper,graph,frame);
+		
         ret = av_buffersrc_add_frame(filt_in, frame);
         if (ret < 0)
             goto the_end;
@@ -3284,6 +3292,8 @@ static VideoState *stream_open(const char *filename,
     is->muted = 0;
     is->av_sync_type = av_sync_type;
     is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
+	
+	event_warpper_init(&is->event_warpper);
     if (!is->read_tid) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
 fail:
@@ -3443,6 +3453,7 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
+		submit_event(&cur_stream->event_warpper,event);
         switch (event.type) {
         case SDL_KEYDOWN:
             if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
