@@ -1,0 +1,10 @@
+cp /c/msys64/mingw64/bin/libdav1d-7.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libfdk-aac-2.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libmp3lame-0.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libopus-0.dll ./build/bin/
+cp /c/msys64/mingw64/bin/SDL2.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libva_win32.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libva.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libx264-165.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libharfbuzz-0.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libx265-215.dll ./build/bin/

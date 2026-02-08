@@ -1413,6 +1413,7 @@ static int video_open(VideoState *is)
     is->width  = w;
     is->height = h;
 
+    submit_size_event(&is->event_warpper,w,h);
     return 0;
 }
 
@@ -3294,6 +3295,7 @@ static VideoState *stream_open(const char *filename,
     is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
 	
 	event_warpper_init(&is->event_warpper);
+    
     if (!is->read_tid) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
 fail:
@@ -3627,6 +3629,7 @@ static void event_loop(VideoState *cur_stream)
                         SDL_DestroyTexture(cur_stream->vis_texture);
                         cur_stream->vis_texture = NULL;
                     }
+                    submit_size_event(&cur_stream->event_warpper,screen_width,screen_height);
                     if (vk_renderer)
                         vk_renderer_resize(vk_renderer, screen_width, screen_height);
                 case SDL_WINDOWEVENT_EXPOSED:
@@ -3973,6 +3976,14 @@ int main(int argc, char **argv)
         }
     }
 
+    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "0"); // 不显示输入法UI
+    SDL_SetHint(SDL_HINT_IME_INTERNAL_EDITING, "0"); // 禁用IME内部编辑
+    SDL_StopTextInput(); // 停止文本输入事件（IME的核心）
+    SDL_SetTextInputRect(NULL); // 清空IME的输入区域，彻底禁用
+    
+    // 额外：确保SDL捕获所有按键，包括系统级组合键（可选）
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1"); // 独占键盘（窗口激活时）
+    
     is = stream_open(input_filename, file_iformat);
     if (!is) {
         av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");

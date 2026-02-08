@@ -1,0 +1,6 @@
+ioplaying=cond='key:t:press':out=metadata[t_toggle]=1                                    当按键T按下时，向帧元数据写入键值对(t_toggle,1)
+ioplaying=cond='mouse:left:press':out='metadata:l_toggle'='{expr:dur*x/window_w}'    当按下鼠标左键时，向帧元数据写入键值对(l_toggle,鼠标横坐标占窗口宽度的比例对应的视频时长)
+ioplaying=cond=move:out='metadata:mv_toggle'='{key:g}'                                当鼠标移动时，向帧元数据写入键值对(mv_toggle,按键g是否按下（按下为1，不按下为0）
+ioplaying=cond=all:out='metadata:any'='{if:key:k?K被按下了:K未被按下}'             当本滤镜被执行时，向帧元数据写入键值对(any,如果按键k被按下则是‘K被按下了’否则是‘K未被按下’)
+ioplaying=cond='mouse:left:press':out='file:my1.txt'='{t}'                                    当按下鼠标左键时，向文件写入内容：播放进度（秒数，文件存在会丢弃原内容，不存在就创建文件）
+ioplaying=cond='key:y:press':out=print='Y键被按下'                                            当按键Y按下时，向ffplay的控制台输出内容：Y键被按下
