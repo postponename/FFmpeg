@@ -3976,13 +3976,12 @@ int main(int argc, char **argv)
         }
     }
 
-    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "0"); // 不显示输入法UI
-    SDL_SetHint(SDL_HINT_IME_INTERNAL_EDITING, "0"); // 禁用IME内部编辑
-    SDL_StopTextInput(); // 停止文本输入事件（IME的核心）
-    SDL_SetTextInputRect(NULL); // 清空IME的输入区域，彻底禁用
+    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "0");
+    SDL_SetHint(SDL_HINT_IME_INTERNAL_EDITING, "0");
+    SDL_StopTextInput();
+    SDL_SetTextInputRect(NULL);
     
-    // 额外：确保SDL捕获所有按键，包括系统级组合键（可选）
-    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1"); // 独占键盘（窗口激活时）
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
     
     is = stream_open(input_filename, file_iformat);
     if (!is) {

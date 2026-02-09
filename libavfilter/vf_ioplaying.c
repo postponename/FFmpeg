@@ -21,10 +21,10 @@ static av_cold int init(AVFilterContext *ctx)
 {
 	IOPlayingContext *ioctx = ctx->priv;
     EventContent event=ioctx->event;
-    av_log(ioctx, AV_LOG_INFO, 
+    av_log(ioctx, AV_LOG_DEBUG, 
            "init=event.key_state_map=%p:event.mouse_x=%d\n",(void*)event.key_state_map,event.mouse_x);
     av_bprint_init(&ioctx->expanded_out,0,AV_BPRINT_SIZE_UNLIMITED);
-    av_bprint_init(&ioctx->keynames2codes,0,AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_init(&ioctx->output_expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
     
 	return 0;
 }
@@ -32,7 +32,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     IOPlayingContext *ioctx = ctx->priv;
     av_bprint_finalize(&ioctx->expanded_out,NULL);
-    av_bprint_finalize(&ioctx->keynames2codes,NULL);
+    av_bprint_finalize(&ioctx->output_expr_prep,NULL);
 }
 
 
@@ -160,9 +160,6 @@ static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,EventCon
                "The condition type 'key' must have at least TWO parameters,but only %d\n",argc);
     }
     
-    av_log(log_ctx, AV_LOG_INFO, 
-           "eval_cond_key=keyname=%s:action=%s:event=%p\n",argv[0],argv[1],event);
-
     int valid_key=0,keycode=0;
     keycode_from_name(log_ctx,event,argv[0],&valid_key,&keycode);
     
@@ -197,8 +194,6 @@ static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventC
         av_log(log_ctx, AV_LOG_ERROR, 
                "The condition type 'mouse' must have at least TWO parameters,but only %d\n",argc);
     }
-    av_log(log_ctx, AV_LOG_INFO,
-           "eval_cond_mouse=keyname=%s:action=%s:event=%p\n",argv[0],argv[1],event);
     
     char *btnname=argv[0];
     int status=-1;
@@ -291,7 +286,7 @@ static int eval_condition_args(IOPlayingContext *log_ctx,EventContent *event,con
             
             int arg_len=strlen(argv[i]);
             int expr_len=arg_len-5;//mods=
-            char *expr=malloc(expr_len);
+            char *expr=malloc(expr_len+1);
             expr[expr_len]=0;
             memcpy(expr,after_name,expr_len);
             eval_mods_expr(expr,event,&has_mods,&mods_res);
@@ -527,13 +522,6 @@ static void fill_expansion_context(output_value_expr_expansion_context *ctx)
         var_vals[i]=strtod_silent(e->value);
     }
     
-    av_log(ctx->io,AV_LOG_INFO,"you have these variables to use in the expression,and their values\n");
-    for(int i=0;i<nb_var;i++)
-    {
-        av_log(ctx->io,AV_LOG_INFO,"\t%s:\t%g\n",var_names[i],var_vals[i]);
-    }
-    av_log(ctx->io,AV_LOG_INFO,"have fun with your expressions\n");
-    
     ctx->f1_names=output_value_expr_f1_names;
     ctx->f1_ptrs=output_value_expr_f1_ptrs;
 }
@@ -547,17 +535,6 @@ static void free_expansion_context(output_value_expr_expansion_context *ctx)
     av_freep(&ctx->var_values);
 }
 
-static void dummy_expansion_json(void *ctx,AVBPrint *bp,const char *name,char **argv,int argc)
-{
-    av_bprintf(bp,"{\"name\":\"%s\",\"args\":[",name);
-    for(int i=0;i<argc;i++)
-    {
-        av_bprintf(bp,"\"%s\"",argv[i]);
-        if(i!=argc-1)
-            av_bprint_chars(bp,',',1);
-    }
-    av_bprintf(bp,"]}");
-}
 static void out_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
@@ -616,12 +593,17 @@ static void out_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **arg
 static void out_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
-    AVDictionaryEntry *e=av_dict_get(ctx->frm->metadata,argv[0],NULL,0);
+    char *metakey=argv[0];
+    char *defval=NULL;
+    if(argc>=2)
+        defval=argv[1];
+    
+    AVDictionaryEntry *e=av_dict_get(ctx->frm->metadata,metakey,NULL,0);
     
     if (e&&e->value)
         av_bprintf(bp,"%s",e->value);
-    else if(argc>=2)
-        av_bprintf(bp,"%s",argv[1]);
+    else if(defval)
+        av_bprintf(bp,"%s",defval);
 }
 static void out_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
@@ -635,64 +617,150 @@ static void out_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv
     }
 }
 
-static const char* handle_expr_keynames(output_value_expr_expansion_context *ctx,const char *expr)
+typedef struct
 {
-    AVBPrint *bp=&ctx->io->keynames2codes;
+    const char *name;
+    void (*prep)(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
+}expr_prep_func_entry;
+static void expr_prep_keyname(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
+static void expr_prep_metadata_call(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
+
+static const expr_prep_func_entry prep_func_table[]=
+{
+    {"key",         expr_prep_keyname          },
+    {"metadata",    expr_prep_metadata_call    }
+};
+
+
+static void expr_prep_keyname(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* func_name,const char *args)
+{
+    const char *keyname=args;
+    
+    int valid_key=0,keycode=0;
+    keycode_from_name(ctx->io,&(ctx->io->event),keyname,&valid_key,&keycode);
+    
+    if(!valid_key)
+    {
+        av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess: Invalid key name '%s' in %s() function\n",keyname,func_name);
+        return;
+    }
+    
+    av_bprintf(bp,"%s(%d)",func_name,keycode);
+}
+static void expr_prep_metadata_call(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* func_name,const char *args)
+{
+    char *metakey=av_get_token(&args,",");
+    char *defval=NULL;
+    if(*args==',')
+    {
+        args++;
+        if(*args)
+        {
+            defval=av_get_token(&args,"");
+        }
+    }
+    
+    AVDictionaryEntry *e=av_dict_get(ctx->frm->metadata,metakey,NULL,0);
+    
+    if (e&&e->value)
+        av_bprintf(bp,"%s",e->value);
+    else if(defval)
+        av_bprintf(bp,"%s",defval);
+    
+    av_freep(&metakey);
+    av_freep(&defval);
+}
+
+
+
+
+
+
+static void skip_whitespace(const char **expr)
+{
+    while (*expr && av_isspace(**expr)) {
+        (*expr)++;
+    }
+}
+static int match_do_prep_funcs(output_value_expr_expansion_context *ctx,const char **expr,AVBPrint *bp)
+{
+    int nb_prep_func=FF_ARRAY_ELEMS(prep_func_table);
+    int matched=0;
+    
+    for(int i=0;i<nb_prep_func;i++)
+    {
+        const char *func_name=prep_func_table[i].name;
+        int func_len=strlen(func_name);
+        
+        if(strncmp(*expr,func_name,func_len)==0)
+        {
+            matched=1;
+            (*expr)+=func_len;
+            
+            skip_whitespace(expr); // 先跳过括号前的空白
+            if(**expr!='(')
+            {
+                av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess: Expected '(' after '%s' near '%s'\n",func_name,*expr);
+                goto fail;
+            }
+            (*expr)++; // 跳过左括号
+            
+            char *args_tk=av_get_token(expr,")");
+            if(!args_tk||*args_tk=='\0'||**expr!=')')
+            {
+                av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess:Unmatched '(' or invalid arguments in %s() function near '%s'\n",func_name,*expr);
+                av_freep(&args_tk);
+                goto fail;
+            }
+            (*expr)++;// 跳过右括号
+            
+            prep_func_table[i].prep(ctx,bp,func_name,args_tk);
+            av_freep(&args_tk);
+            
+            break;
+        }
+    }
+    
+    return matched;
+fail:
+    return -1;
+}
+static const char* expr_preprocess(output_value_expr_expansion_context *ctx,const char *expr)
+{
+    AVBPrint *bp=&ctx->io->output_expr_prep;
     av_bprint_clear(bp);
     
-    static const char *key_func_name="key";
-    int key_func_name_len=strlen(key_func_name);
     
     while(*expr)
     {
-        int flag=1;
-        for(int i=0;i<key_func_name_len;i++)
+        int matched=match_do_prep_funcs(ctx,&expr,bp);
+        if(matched<0)
         {
-            if(!expr[i]||expr[i]!=key_func_name[i])
-            {
-                flag=0;
-                break;
-            }
+            goto fail;
         }
-        if(flag)
-        {
-            expr+=key_func_name_len;
-            while(av_isspace(*expr)) expr++;
-            if(*expr!='(')
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"Excepting '(' after 'key' near '%s'\n",expr);
-                return "";
-            }
-            expr++;
-            char *keyname=av_get_token(&expr,")");
-            int valid_key=0,keycode=0;
-            keycode_from_name(ctx->io,&ctx->io->event,keyname,&valid_key,&keycode);
-            av_freep(&keyname);
-            if(!valid_key)
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"invalid key '%s'\n",keyname);
-                return "";
-            }
-            if(*expr!=')')
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"Unmatching '(' near '%s'\n",expr);
-                return "";
-            }
-            expr++;
-            av_bprintf(bp,"key(%d)",keycode);
-        }
-        else
+        if(!matched)
         {
             av_bprint_chars(bp,*expr,1);
             expr++;
         }
     }
+    
+    if(!av_bprint_is_complete(bp))
+    {
+        av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess buffer overflow\n");
+        goto fail;
+    }
+    
     return bp->str;
+    
+fail:
+    av_bprint_clear(bp);
+    return "";
 }
 
 static double do_eval_expr(output_value_expr_expansion_context *ctx,const char *ori_expr)
 {
-    const char *expr=handle_expr_keynames(ctx,ori_expr);
+    const char *expr=expr_preprocess(ctx,ori_expr);
     
     AVExpr *expr_tree=NULL;
     
@@ -905,12 +973,12 @@ static const output_entry output_table[]=
 
 static int parse_output(IOPlayingContext *log_ctx,const char *out,char **output_key,char **output_value)
 {
-    char *name=av_get_token(&out,":="); // 分隔符是:，p会自动移动到下一个段
+    char *name=av_get_token(&out,":="); // 分隔符是:或者=，p会自动移动到下一个段
     if(!name||*name =='\0')
     {
         av_log(log_ctx, AV_LOG_ERROR, 
                "The condition parse failed near '%s'\n",out);
-        av_free(name);
+        av_freep(&name);
         return 0;
     }
 
@@ -1016,15 +1084,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 	IOPlayingContext *ioctx=ctx->priv;
     if(!ioctx->event.window_w)
     {
-        av_log(ioctx, AV_LOG_INFO, 
+        av_log(ioctx, AV_LOG_DEBUG, 
                "context not initialized,do nothing\n");
         return ff_filter_frame(ctx->outputs[0], frame);
     }
     
     if(eval_condition(ioctx,ioctx->cond_expr,&ioctx->event))
     {
-        av_log(ioctx, AV_LOG_INFO, 
-               "output triggered cond=%s,out=%s\n",ioctx->cond_expr,ioctx->out_expr);
+        av_log(ioctx, AV_LOG_DEBUG, 
+               "ioplaying triggered cond=%s, out=%s\n",ioctx->cond_expr,ioctx->out_expr);
         char *output_key=NULL,*output_value=NULL;
         int type=parse_output(ioctx,ioctx->out_expr,&output_key,&output_value);
         handle_output(inlink,frame,type,&output_key,&output_value);
@@ -1051,7 +1119,7 @@ static const AVOption ioplaying_options[]=
 
 AVFILTER_DEFINE_CLASS(ioplaying);
 
-static const AVFilterPad drawbox_inputs[] = 
+static const AVFilterPad ioplaying_inputs[] = 
 {
 	{.name="default",.type=AVMEDIA_TYPE_VIDEO,.filter_frame=filter_frame},
 };
@@ -1064,7 +1132,7 @@ const FFFilter ff_vf_ioplaying = {
 	.priv_size     = sizeof(IOPlayingContext),
 	.init          = init,
     .uninit        = uninit,
-	FILTER_INPUTS(drawbox_inputs),
+	FILTER_INPUTS(ioplaying_inputs),
 	FILTER_OUTPUTS(ff_video_default_filterpad),
 	FILTER_PIXFMTS_ARRAY(pix_fmts),
 	.process_command = process_command,

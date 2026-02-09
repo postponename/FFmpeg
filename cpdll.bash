@@ -1,5 +1,4 @@
 cp /c/msys64/mingw64/bin/libdav1d-7.dll ./build/bin/
-cp /c/msys64/mingw64/bin/libfdk-aac-2.dll ./build/bin/
 cp /c/msys64/mingw64/bin/libmp3lame-0.dll ./build/bin/
 cp /c/msys64/mingw64/bin/libopus-0.dll ./build/bin/
 cp /c/msys64/mingw64/bin/SDL2.dll ./build/bin/

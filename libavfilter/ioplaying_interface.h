@@ -30,7 +30,7 @@ typedef struct IOPlayingContext
     int start_number;
     
     AVBPrint expanded_out;
-    AVBPrint keynames2codes;
+    AVBPrint output_expr_prep;
     
     EventContent event;
     AVDictionary **var_dict;

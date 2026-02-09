@@ -17,7 +17,7 @@ static int from_sdlkeycode_to_ioplaying(SDL_Keycode code)
 
 void event_warpper_init(EventWarpper *warp)
 {
-    printf("event_warpper_init=warp=%p\n",(void*)warp);
+    av_log(NULL, AV_LOG_DEBUG,"event_warpper_init=warp=%p\n",(void*)warp);
     memset(warp,0,sizeof(EventWarpper));
     ff_hashtable_alloc(&warp->content.key_state_map,sizeof(int),1,256);
     warp->content.keyname_mapper=get_key_from_name;
@@ -29,7 +29,7 @@ void event_warpper_init(EventWarpper *warp)
 
 void event_warpper_uninit(EventWarpper *warp)
 {
-    printf("event_warpper_uninit=warp=%p\n",(void*)warp);
+    av_log(NULL, AV_LOG_DEBUG,"event_warpper_uninit=warp=%p\n",(void*)warp);
     ff_hashtable_freep(&warp->content.key_state_map);
     warp->content.key_state_map=NULL;
     SDL_DestroyMutex(warp->mutex);
