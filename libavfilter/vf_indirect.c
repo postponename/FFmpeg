@@ -14,30 +14,27 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
+#include "ioplaying_interface.h"
+#include "textutils.h"
+#include "exprpreputil.h"
+#include "textexpandutil.h"
 #include <math.h>
 #include <fenv.h>
-
-typedef struct IndirectContext
-{
-    const AVClass *class;
-    
-    char *cond_expr,*vf_desc;
-    int start_number;
-    
-    AVBPrint cond_expr_prep;
-}IndirectContext;
 
 static av_cold int init(AVFilterContext *ctx)
 {
 	IndirectContext *indctx = ctx->priv;
-    av_bprint_init(&indctx->cond_expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
+    memset(&indctx->ioplaying_global,0,sizeof(IOPlayingGlobal));
+    av_bprint_init(&indctx->expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_init(&indctx->vf_desc_expand,0,AV_BPRINT_SIZE_UNLIMITED);
     
 	return 0;
 }
 static av_cold void uninit(AVFilterContext *ctx)
 {
     IndirectContext *indctx = ctx->priv;
-    av_bprint_finalize(&indctx->cond_expr_prep,NULL);
+    av_bprint_finalize(&indctx->expr_prep,NULL);
+    av_bprint_finalize(&indctx->vf_desc_expand,NULL);
 }
 
 
@@ -67,6 +64,44 @@ static const enum AVPixelFormat pix_fmts[]=
 	AV_PIX_FMT_NONE
 };
 
+
+static const char * expr_var_names[]=
+{
+    "sar",
+    "dar",
+    "main_h",                 ///< height of the input video
+    "main_w",                 ///< width  of the input video
+    "n",                      ///< number of frame
+    "t",                      ///< timestamp expressed in seconds
+    "pict_type",
+    "duration",
+    NULL
+};
+static double expr_var_values[]=
+{
+    0,              //sar
+    0,              //dar
+    0,              //main_h
+    0,              //main_w
+    0,              //n
+    0,              //t
+    0,              //pict_type
+    0,              //duration
+    0               //NULL
+};
+enum out_value_expr_var_index
+{
+    VAR_SAR,
+    VAR_DAR,
+    VAR_MAIN_H,
+    VAR_MAIN_W,
+    VAR_N,
+    VAR_T,
+    VAR_PICT_TYPE,
+    VAR_DURATION,
+    VAR_NUMBER,
+};
+
 typedef struct
 {
     AVFilterLink *inlink;
@@ -74,41 +109,48 @@ typedef struct
     IndirectContext *ind;
     AVFrame *frm;
     
+    double pts;
+    int frame_number;
     const char **var_names;
     double *var_values;
     const char **f1_names;
     double (**f1_ptrs)(void*,double);
     
-}cond_expr_evaluation_context;
+}indirect_expansion_context;
 
 
-static void fill_eval_context(cond_expr_evaluation_context *ctx)
+static void fill_eval_context(indirect_expansion_context *ctx)
 {
-    ctx->var_names=NULL;
-    ctx->var_values=NULL;
+    AVFilterLink *inlink=ctx->inlink;
+    FilterLink *ff_inl=ff_filter_link(ctx->inlink);
+    ctx->pts=((ctx->frm->pts==AV_NOPTS_VALUE)?NAN:(ctx->frm->pts*av_q2d(ctx->inlink->time_base)));
+    ctx->frame_number=ff_inl->frame_count_out+ctx->ind->start_number;
+    
+    ctx->var_names=expr_var_names;
+    ctx->var_values=expr_var_values;
+    
+    ctx->var_values[VAR_SAR]=inlink->sample_aspect_ratio.num ? av_q2d(inlink->sample_aspect_ratio) : 1;
+    ctx->var_values[VAR_DAR]=(double)inlink->w / inlink->h * ctx->var_values[VAR_SAR];
+    ctx->var_values[VAR_MAIN_H]=inlink->h;
+    ctx->var_values[VAR_MAIN_W]=inlink->w;
+    ctx->var_values[VAR_N]=ctx->frame_number;
+    ctx->var_values[VAR_T]=ctx->pts;
+    ctx->var_values[VAR_PICT_TYPE]=ctx->frm->pict_type;
+    ctx->var_values[VAR_DURATION]=ctx->frm->duration*av_q2d(inlink->time_base);
+    
     ctx->f1_names=NULL;
     ctx->f1_ptrs=NULL;
 }
-static void free_eval_context(cond_expr_evaluation_context *ctx)
+static void free_eval_context(indirect_expansion_context *ctx)
 {
     
 }
 
 
-typedef struct
-{
-    const char *name;
-    void (*prep)(cond_expr_evaluation_context *ctx,AVBPrint *bp,const char* name,const char *args);
-}expr_prep_func_entry;
-static void expr_prep_metadata_call(cond_expr_evaluation_context *ctx,AVBPrint *bp,const char* name,const char *args);
 
-static const expr_prep_func_entry prep_func_table[]=
+static void expr_prep_metadata_call(void *c0,void *log_ctx,AVBPrint *bp,const char* func_name,const char *args)
 {
-    {"metadata",    expr_prep_metadata_call    }
-};
-
-static void expr_prep_metadata_call(cond_expr_evaluation_context *ctx,AVBPrint *bp,const char* func_name,const char *args)
-{
+    indirect_expansion_context *ctx=c0;
     char *metakey=av_get_token(&args,",");
     char *defval=NULL;
     if(*args==',')
@@ -131,92 +173,22 @@ static void expr_prep_metadata_call(cond_expr_evaluation_context *ctx,AVBPrint *
     av_freep(&defval);
 }
 
+static FFExprPreprocer prep_func_table[]=
+{
+    {"metadata",    expr_prep_metadata_call    }
+};
 
-static void skip_whitespace(const char **expr)
+static double do_eval_expr(indirect_expansion_context *ctx,const char* ori_expr)
 {
-    while (*expr && av_isspace(**expr)) {
-        (*expr)++;
-    }
-}
-static int match_do_prep_funcs(cond_expr_evaluation_context *ctx,const char **expr,AVBPrint *bp)
-{
-    int nb_prep_func=FF_ARRAY_ELEMS(prep_func_table);
-    int matched=0;
-    
-    for(int i=0;i<nb_prep_func;i++)
+    FFExprPrepContext prep_ctx=
     {
-        const char *func_name=prep_func_table[i].name;
-        int func_len=strlen(func_name);
-        
-        if(strncmp(*expr,func_name,func_len)==0)
-        {
-            matched=1;
-            (*expr)+=func_len;
-            
-            skip_whitespace(expr); // 先跳过括号前的空白
-            if(**expr!='(')
-            {
-                av_log(ctx->ind,AV_LOG_ERROR,"Expr preprocess: Expected '(' after '%s' near '%s'\n",func_name,*expr);
-                goto fail;
-            }
-            (*expr)++; // 跳过左括号
-            
-            char *args_tk=av_get_token(expr,")");
-            if(!args_tk||*args_tk=='\0'||**expr!=')')
-            {
-                av_log(ctx->ind,AV_LOG_ERROR,"Expr preprocess:Unmatched '(' or invalid arguments in %s() function near '%s'\n",func_name,*expr);
-                av_freep(&args_tk);
-                goto fail;
-            }
-            (*expr)++;// 跳过右括号
-            
-            prep_func_table[i].prep(ctx,bp,func_name,args_tk);
-            av_freep(&args_tk);
-            
-            break;
-        }
-    }
-    
-    return matched;
-    fail:
-    return -1;
-}
-static const char* expr_preprocess(cond_expr_evaluation_context *ctx,const char *expr)
-{
-    AVBPrint *bp=&ctx->ind->cond_expr_prep;
-    av_bprint_clear(bp);
-    
-    while(*expr)
-    {
-        int matched=match_do_prep_funcs(ctx,&expr,bp);
-        if(matched<0)
-        {
-            goto fail;
-        }
-        if(!matched)
-        {
-            av_bprint_chars(bp,*expr,1);
-            expr++;
-        }
-    }
-    
-    if(!av_bprint_is_complete(bp))
-    {
-        av_log(ctx->ind,AV_LOG_ERROR,"Expr preprocess buffer overflow\n");
-        goto fail;
-    }
-    
-    return bp->str;
-    
-    fail:
-    av_bprint_clear(bp);
-    return "";
-}
-
-static double do_eval_cond(cond_expr_evaluation_context *ctx)
-{
-    const char *ori_expr=ctx->ind->cond_expr;
-    const char *expr=expr_preprocess(ctx,ori_expr);
+        .opaque=ctx,
+        .log_ctx=ctx->ind,
+        .bp=&ctx->ind->expr_prep,
+        .funcs=prep_func_table,
+        .nb_funcs=FF_ARRAY_ELEMS(prep_func_table)
+    };
+    const char *expr=ff_expr_preprocess(&prep_ctx,ori_expr);
     
     AVExpr *expr_tree=NULL;
     
@@ -236,31 +208,209 @@ static double do_eval_cond(cond_expr_evaluation_context *ctx)
     return value;
 }
 
-static int eval_condition(AVFilterLink *inlink,AVFrame *frm)
+static int eval_condition(indirect_expansion_context *eval_ctx)
+{    
+    return do_eval_expr(eval_ctx,eval_ctx->ind->cond_expr);
+}
+
+typedef struct
 {
-    cond_expr_evaluation_context eval_ctx=
+    const char *name;
+    void (*expand)(void *ctx,AVBPrint *bp,const char *name,char **argv,int argc);
+}vf_desc_expansion_func_entry;
+static void vfdesc_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static vf_desc_expansion_func_entry vfdesc_func_table[]=
+{
+    {"pict_type",          vfdesc_func_pict_type          },
+    {"pts",                vfdesc_func_pts                },
+    {"frame_num",          vfdesc_func_frame_num          },
+    {"n",                  vfdesc_func_frame_num          },
+    {"metadata",           vfdesc_func_metadata           },
+    {"gmtime",             vfdesc_func_strftime           },
+    {"localtime",          vfdesc_func_strftime           },
+    {"expr",               vfdesc_func_eval_expr          },
+    {"e",                  vfdesc_func_eval_expr          },
+    {"expr_int_format",    vfdesc_func_eval_expr_int_fmt  },
+    {"eif",                vfdesc_func_eval_expr_int_fmt  },
+    {"if",                 vfdesc_func_if                 },
+};
+
+static void vfdesc_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    ff_expand_func_pict_type(ctx->ind,ctx->frm,bp,name,argv,argc);
+}
+static void vfdesc_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    ff_expand_func_pts(ctx->ind,ctx->pts,bp,name,argv,argc);
+}
+static void vfdesc_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    ff_expand_func_frame_num(ctx->ind,ctx->frame_number,bp,name,argv,argc);
+}
+static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    ff_expand_func_metadata(ctx->ind,ctx->frm,bp,name,argv,argc);
+}
+static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    ff_expand_func_strftime(ctx->ind,bp,name,argv,argc);
+}
+static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    double value=do_eval_expr(ctx,argv[0]);
+    ff_expand_func_eval_expr(ctx->ind,value,bp,name,argv,argc);
+}
+static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    double value=do_eval_expr(ctx,argv[0]);
+    ff_expand_func_eval_expr_int_fmt(ctx->ind,value,bp,name,argv,argc);
+}
+static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    indirect_expansion_context *ctx=c0;
+    double value=do_eval_expr(ctx,argv[0]);
+    ff_expand_func_if(ctx->ind,value,bp,name,argv,argc);
+}
+
+static void do_expand_function(indirect_expansion_context *ctx,AVBPrint *bp,char *name,char **argv,int argc)
+{    
+    int func=-1;
+    int nb_out_func=FF_ARRAY_ELEMS(vfdesc_func_table);
+    
+    for(int i=0;i<nb_out_func;i++)
     {
-        .inlink=inlink,
-        .ctx=inlink->dst,
-        .ind=inlink->dst->priv,
-        .frm=frm
-    };
-    fill_eval_context(&eval_ctx);
-    double value=do_eval_cond(&eval_ctx);
-    free_eval_context(&eval_ctx);
-    return value;
+        if(strcmp(vfdesc_func_table[i].name,name)==0)
+        {
+            func=i;
+            break;
+        }
+    }
+    if(func<0)
+    {
+        av_log(ctx->ind, AV_LOG_ERROR, 
+               "Unknown out func '%s'\n",name);
+        return;
+    }
+    
+    vfdesc_func_table[func].expand(ctx,bp,name,argv,argc);
 }
-
-static const char *expand_video_filter_desc(const char* ori_vf)
+static void expand_vf_desc_function(indirect_expansion_context *ctx,AVBPrint *bp,const char **pdesc)
 {
-    return ori_vf;
+    const char *desc=*pdesc;
+    av_assert0(*desc=='$');
+    
+    int dcnt=0;
+    while(*desc=='$')
+        dcnt++,++desc;
+    if(dcnt>1)
+    {
+        av_bprint_chars(bp,'$',dcnt-1);
+        *pdesc=desc;
+        return;
+    }
+    av_assert0(dcnt==1&&*desc!='$');
+    
+    if(*desc!='(')
+    {
+        av_bprint_chars(bp,'$',1);
+        *pdesc=desc;
+        return;
+    }
+    desc++;
+    
+    char *argv[16];
+    int argc=0;
+    while(1)
+    {
+        if(!(argv[argc++]=av_get_token(&desc, "|)")))
+        {
+            av_log(ctx->ind,AV_LOG_ERROR,"av_get_token failed because of onmem\n");
+            goto end;
+        }
+        if (!*desc)
+        {
+            av_log(ctx->ind,AV_LOG_ERROR,"Unterminated $...$() near '%s'\n", *pdesc);
+            goto end;
+        }
+        if(argc==FF_ARRAY_ELEMS(argv))
+            av_freep(&argv[--argc]);
+        if(*desc==')')
+            break;
+        desc++;
+    }
+    
+    *pdesc=desc+1;
+    do_expand_function(ctx,bp,argv[0],argv+1,argc-1);
+    
+end:
+    for(int i=0;i<argc;i++)
+        av_freep(&argv[i]);
+}
+static const char *expand_video_filter_desc(indirect_expansion_context *ctx,const char* ori_vf)
+{
+    AVBPrint *bp=&ctx->ind->vf_desc_expand;
+    av_bprint_clear(bp);
+    
+    while(*ori_vf)
+    {
+        if(*ori_vf=='$')
+        {
+            expand_vf_desc_function(ctx,bp,&ori_vf);
+        }
+        else
+        {
+           av_bprint_chars(bp,*ori_vf,1);
+           ori_vf++;
+        }
+    }
+    if(!av_bprint_is_complete(bp))
+    {
+        av_log(ctx->ind,AV_LOG_ERROR,"bprint failed because of onmem\n");
+    }
+    
+    
+    return bp->str;
 }
 
-
-
+static int ioplaying_check(IndirectContext *ind)
+{
+    return ind->ioplaying_global.window_w!=0;
+}
+static void fill_ioplaying(IndirectContext *ind,AVFilterGraph *graph)
+{
+    if(!ioplaying_check(ind))
+        return;
+    for(int i=0;i<graph->nb_filters;i++)
+    {
+        AVFilterContext *fi=graph->filters[i];
+        if(strcmp(fi->filter->name,"ioplaying")==0)
+        {
+            IOPlayingContext *iopctx=fi->priv;
+            iopctx->global=ind->ioplaying_global;
+        }
+        if(strcmp(fi->filter->name,"indirect")==0)
+        {
+            IndirectContext *indctx=fi->priv;
+            indctx->ioplaying_global=ind->ioplaying_global;
+        }
+    }
+}
 static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectContext *ind,const char *vfilter)
 {
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     int ret=0;
     FilterLink *inl=ff_filter_link(inlink);
     AVFilterGraph *graph=NULL;
@@ -268,7 +418,6 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     AVFilterInOut *inputs=NULL;
     char *scale_sws_opts=NULL;
     AVBufferSrcParameters *par=NULL;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     graph=avfilter_graph_alloc();
     if(!graph)
@@ -276,7 +425,6 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
         ret=AVERROR(ENOMEM);
         goto fail;
     }
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     graph->nb_threads=1;
     
@@ -285,7 +433,6 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
         scale_sws_opts=av_strdup(inl->graph->scale_sws_opts);
         graph->scale_sws_opts=scale_sws_opts;
     }
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     AVFilterContext *filt_src=avfilter_graph_alloc_filter(graph,avfilter_get_by_name("buffer"),"ffplay_buffer");
     if(!filt_src)
@@ -293,7 +440,6 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
         ret=AVERROR(ENOMEM);
         goto fail;
     }
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     par=av_buffersrc_parameters_alloc();
     par->format              = frame->format;
@@ -309,12 +455,10 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     ret=av_buffersrc_parameters_set(filt_src,par);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     ret=avfilter_init_dict(filt_src,NULL);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     AVFilterContext *filt_out=avfilter_graph_alloc_filter(graph,avfilter_get_by_name("buffersink"),"ffplay_buffersink");
     if(!filt_out)
@@ -322,18 +466,15 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     int nb_pix_fmts=FF_ARRAY_ELEMS(pix_fmts);
     nb_pix_fmts--;//terminating AV_PIX_FMT_NONE
     if((ret=av_opt_set_array(filt_out,"pixel_formats",AV_OPT_SEARCH_CHILDREN,0,nb_pix_fmts,AV_OPT_TYPE_PIXEL_FMT,pix_fmts))<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     ret=avfilter_init_dict(filt_out,NULL);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     
     int nb_filters=graph->nb_filters;
@@ -344,7 +485,6 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     outputs->name       = av_strdup("in");
     outputs->filter_ctx = filt_src;
@@ -355,37 +495,30 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     inputs->filter_ctx  = filt_out;
     inputs->pad_idx     = 0;
     inputs->next        = NULL;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     if((ret=avfilter_graph_parse_ptr(graph,vfilter,&inputs,&outputs,NULL))<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     /* Reorder the filters to ensure that inputs of the custom filters are merged first */
     for (int i = 0; i < graph->nb_filters - nb_filters; i++)
         FFSWAP(AVFilterContext*, graph->filters[i], graph->filters[i + nb_filters]);
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     ret=avfilter_graph_config(graph,NULL);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
+    
+    fill_ioplaying(ind,graph);
     
     ret=av_buffersrc_add_frame(filt_src,frame);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
-    
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     ret=av_buffersink_get_frame_flags(filt_out,frame,0);
     if(ret<0)
         goto fail;
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
     
     ret=ff_filter_frame(inlink->dst->outputs[0],frame);
-    av_log(inlink->dst,AV_LOG_INFO,"execute_video_filter %d\n",__LINE__);
-
+    
 fail:
     avfilter_inout_free(&outputs);
     avfilter_inout_free(&inputs);
@@ -394,22 +527,37 @@ fail:
     return ret;
 }
 
-
-
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
 	AVFilterContext *ctx = inlink->dst;
 	IndirectContext *indctx=ctx->priv;
-
-    if(indctx->vf_desc&&eval_condition(inlink,frame))
+    if(indctx->wait_ioplaying&&!ioplaying_check(indctx))
     {
-        av_log(indctx, AV_LOG_INFO, 
-               "indirect triggered cond=%s, vf=%s\n",indctx->cond_expr,indctx->vf_desc);
-        const char *vfilter=expand_video_filter_desc(indctx->vf_desc);
-        return execute_video_filter(inlink,frame,indctx,vfilter);
+        av_log(indctx,AV_LOG_DEBUG,"context not initialized,do nothing\n");
+        return ff_filter_frame(ctx->outputs[0], frame);
     }
     
-    return ff_filter_frame(ctx->outputs[0], frame);
+    indirect_expansion_context expd_ctx=
+    {
+        .inlink=inlink,
+        .ctx=ctx,
+        .ind=indctx,
+        .frm=frame
+    };
+    fill_eval_context(&expd_ctx);
+    int ret=0;
+    if(indctx->vf_desc&&eval_condition(&expd_ctx))
+    {
+        av_log(indctx,AV_LOG_INFO,"indirect triggered cond=%s, vf=%s\n",indctx->cond_expr,indctx->vf_desc);
+        const char *vfilter=expand_video_filter_desc(&expd_ctx,indctx->vf_desc);        
+        ret=execute_video_filter(inlink,frame,indctx,vfilter);
+    }
+    else
+    {
+        ret=ff_filter_frame(ctx->outputs[0],frame);
+    }
+    free_eval_context(&expd_ctx);
+    return ret;
 }
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args, char *res, int res_len, int flags)
@@ -423,10 +571,11 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
 
 static const AVOption indirect_options[]=
 {
-	{ "cond",            "condition to toggle the indirect execution",           OFFSET(cond_expr),    AV_OPT_TYPE_STRING, { .str="never" },       0, 0,       FLAGS },
-	{ "vf",              "set video filters",                                    OFFSET(vf_desc),      AV_OPT_TYPE_STRING, { .str=NULL  },       0, 0,       FLAGS },
-    { "start_number",    "start frame number for n/frame_num variable",          OFFSET(start_number), AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS},
-	{ NULL }
+	{ "cond",            "condition to toggle the indirect execution",                                                       OFFSET(cond_expr),         AV_OPT_TYPE_STRING, { .str="0"     },       0, 0,       FLAGS },
+	{ "vf",              "set video filters",                                                                                OFFSET(vf_desc),           AV_OPT_TYPE_STRING, { .str=NULL    },       0, 0,       FLAGS },
+    { "start_number",    "start frame number for n/frame_num variable",                                                      OFFSET(start_number),      AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS },
+	{ "wait_ioplaying",  "weather the execution of video filters depends on the readility of the context for ioplaying ",    OFFSET(wait_ioplaying),    AV_OPT_TYPE_INT,    { .i64=1       },       0, INT_MAX, FLAGS },
+    { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(indirect);

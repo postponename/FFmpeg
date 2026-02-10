@@ -4,13 +4,19 @@
 #include "libavfilter/ioplaying_interface.h"
 #include<SDL.h>
 #include<SDL_thread.h>
+typedef struct keystatus_getter_context
+{
+    SDL_mutex *mutex;
+    FFHashtableContext *map;
+}keystatus_getter_context;
 
 typedef struct EventWarpper
 {
-	EventContent content;
+	IOPlayingGlobal global;
+    
+    SDL_mutex *mutex;
+    keystatus_getter_context key_status;
     AVDictionary *var_dict;
-	SDL_mutex *mutex;
-    FFHashtableContext *key_state_map;
 }EventWarpper;
 
 void event_warpper_init(EventWarpper *warp);

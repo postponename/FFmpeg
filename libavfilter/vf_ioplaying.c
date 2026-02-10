@@ -14,15 +14,15 @@
 #include "video.h"
 #include "textutils.h"
 #include "ioplaying_interface.h"
+#include "exprpreputil.h"
+#include "textexpandutil.h"
 #include <math.h>
 #include <fenv.h>
 
 static av_cold int init(AVFilterContext *ctx)
 {
 	IOPlayingContext *ioctx = ctx->priv;
-    EventContent event=ioctx->event;
-    av_log(ioctx, AV_LOG_DEBUG, 
-           "init=event.key_state_map=%p:event.mouse_x=%d\n",(void*)event.key_state_map,event.mouse_x);
+    memset(&ioctx->global,0,sizeof(IOPlayingGlobal));
     av_bprint_init(&ioctx->expanded_out,0,AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&ioctx->output_expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
     
@@ -35,6 +35,17 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_bprint_finalize(&ioctx->output_expr_prep,NULL);
 }
 
+static int check_keyboard_interface(void *log_ctx,IOPlayingGlobal *gbl)
+{
+    KeyboardStatus *kb=&gbl->keyboard;
+    if(!kb->opaque||!kb->keystatus_getter||!kb->keyname_mapper)
+    {
+        av_log(log_ctx,AV_LOG_ERROR, 
+               "The state of KeyboardStatus is invalid\n");
+        return 0;
+    }
+    return 1;
+}
 
 
 static const enum AVPixelFormat pix_fmts[] = {
@@ -52,7 +63,7 @@ static const enum AVPixelFormat pix_fmts[] = {
 };
 
 
-static void eval_mods_expr(char *expr,EventContent *event,int *has_mods,int *res)
+static void eval_mods_expr(char *expr,IOPlayingGlobal *gbl,int *has_mods,int *res)
 {
     double res_dbl=0;
     const char *const_names[]=
@@ -67,12 +78,12 @@ static void eval_mods_expr(char *expr,EventContent *event,int *has_mods,int *res
     };
     const double const_values[]=
     {
-        (double)event->mod_ctrl,
-        (double)event->mod_shift,
-        (double)event->mod_alt,
-        (double)event->mouse_lbutton,
-        (double)event->mouse_rbutton,
-        (double)event->mouse_mbutton,
+        (double)gbl->keyboard.mod_ctrl,
+        (double)gbl->keyboard.mod_shift,
+        (double)gbl->keyboard.mod_alt,
+        (double)gbl->mouse.left,
+        (double)gbl->mouse.right,
+        (double)gbl->mouse.middle,
     };
     int expr_len=strlen(expr);
     if (strchr(expr,'~'))
@@ -102,13 +113,13 @@ static void eval_mods_expr(char *expr,EventContent *event,int *has_mods,int *res
 typedef struct
 {
     const char *name;
-    int (*eval)(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);    
+    int (*eval)(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);    
 }eval_cond_entry;
-static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);
-static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);
-static int eval_cond_all(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);
-static int eval_cond_never(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);
-static int eval_cond_once(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event);
+static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);
+static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);
+static int eval_cond_all(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);
+static int eval_cond_never(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);
+static int eval_cond_once(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl);
 static const eval_cond_entry eval_cond_table[]=
 {
     {"key",      eval_cond_key      },
@@ -118,41 +129,7 @@ static const eval_cond_entry eval_cond_table[]=
     {"once",     eval_cond_once     },
 };
 
-static void keycode_from_name(IOPlayingContext *log_ctx,EventContent *event,const char *keyname,int *valid,int *out_keycode)
-{
-    if(!event->keyname_mapper)
-    {
-        av_log(NULL, AV_LOG_ERROR, 
-               "parse condition for key failed:invalid keyname mapper\n");
-        *valid=0;
-    }
-    int keycode=event->keyname_mapper(keyname);
-    if(!event->keycode_checker)
-    {
-        av_log(log_ctx, AV_LOG_ERROR, 
-               "parse condition for key failed:invalid keycode checker\n");
-        *valid=0;
-    }
-    if(!event->keycode_checker(keycode))
-    {
-        av_log(log_ctx, AV_LOG_ERROR, 
-               "parse condition for key failed:invalid key '%s'[%d]\n",keyname,keycode);
-        *valid=0;
-    }
-    *valid=1;
-    *out_keycode=keycode;
-}
-
-static int get_key_status(EventContent *event,int keycode)
-{
-    unsigned char keystatus=0;
-    int key_query_res=ff_hashtable_get(event->key_state_map,&keycode,&keystatus);
-    if(!key_query_res)
-        keystatus=0;
-    return keystatus;
-}
-
-static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event)
+static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl)
 {
     if(argc<2)
     {
@@ -160,13 +137,17 @@ static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,EventCon
                "The condition type 'key' must have at least TWO parameters,but only %d\n",argc);
     }
     
+    if(!check_keyboard_interface(log_ctx,gbl))
+        return 0;
+    KeyboardStatus *kb=&gbl->keyboard;
+    
     int valid_key=0,keycode=0;
-    keycode_from_name(log_ctx,event,argv[0],&valid_key,&keycode);
+    kb->keyname_mapper(argv[0],&valid_key,&keycode);
     
     if(!valid_key)
         return 0;
     
-    int keystatus=get_key_status(event,keycode);
+    int keystatus=kb->keystatus_getter(kb->opaque,keycode);
     
     char *action=argv[1];
     int action_int=-1;
@@ -187,7 +168,7 @@ static int eval_cond_key(IOPlayingContext *log_ctx,char **argv,int argc,EventCon
     
     return (keystatus&&action_int)||(!keystatus&&!action_int);
 }
-static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event)
+static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl)
 {
     if(argc<2)
     {
@@ -198,11 +179,11 @@ static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventC
     char *btnname=argv[0];
     int status=-1;
     if(strcmp(btnname,"left")==0||strcmp(btnname,"l")==0)
-        status=event->mouse_lbutton;
+        status=gbl->mouse.left;
     if(strcmp(btnname,"right")==0||strcmp(btnname,"r")==0)
-        status=event->mouse_lbutton;
+        status=gbl->mouse.right;
     if(strcmp(btnname,"middle")==0||strcmp(btnname,"m")==0||strcmp(btnname,"mid")==0)
-        status=event->mouse_mbutton;
+        status=gbl->mouse.middle;
     if(status<0)
     {
         av_log(log_ctx, AV_LOG_ERROR, 
@@ -221,10 +202,6 @@ static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventC
     {
         action_int=1;
     }
-    if(strcmp(action,"dbl")==0||strcmp(action,"dblclk")==0||strcmp(action,"double_click")==0)
-    {
-        action_int=2;
-    }
     if(action_int==-1)
     {
         av_log(log_ctx, AV_LOG_ERROR, 
@@ -232,24 +209,22 @@ static int eval_cond_mouse(IOPlayingContext *log_ctx,char **argv,int argc,EventC
         return 0;
     }
     
-    if(action_int==2)
-        return event->dbl_click;
     return (action_int&&status)||(!action_int&&!status);
 }
-static int eval_cond_all(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event)
+static int eval_cond_all(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *)
 {
     return 1;
 }
-static int eval_cond_never(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *)
+static int eval_cond_never(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *)
 {
     return 0;
 }
-static int eval_cond_once(IOPlayingContext *log_ctx,char **argv,int argc,EventContent *event)
+static int eval_cond_once(IOPlayingContext *log_ctx,char **argv,int argc,IOPlayingGlobal *gbl)
 {
-    return event->once;
+    return gbl->once;
 }
 
-static int eval_condition_args(IOPlayingContext *log_ctx,EventContent *event,const char *name,char **argv,int argc)
+static int eval_condition_args(IOPlayingContext *log_ctx,IOPlayingGlobal *gbl,const char *name,char **argv,int argc)
 {
     int type=-1;
     int nb_eval_cond=FF_ARRAY_ELEMS(eval_cond_table);
@@ -268,7 +243,7 @@ static int eval_condition_args(IOPlayingContext *log_ctx,EventContent *event,con
         return 0;
     }
     
-    int eval_cond_res=eval_cond_table[type].eval(log_ctx,argv,argc,event);
+    int eval_cond_res=eval_cond_table[type].eval(log_ctx,argv,argc,gbl);
     
     int has_mods=0,mods_res=0;
     for(int i=0;i<argc;i++)
@@ -289,7 +264,7 @@ static int eval_condition_args(IOPlayingContext *log_ctx,EventContent *event,con
             char *expr=malloc(expr_len+1);
             expr[expr_len]=0;
             memcpy(expr,after_name,expr_len);
-            eval_mods_expr(expr,event,&has_mods,&mods_res);
+            eval_mods_expr(expr,gbl,&has_mods,&mods_res);
             free(expr);
             break;
         }
@@ -299,7 +274,7 @@ static int eval_condition_args(IOPlayingContext *log_ctx,EventContent *event,con
     return eval_cond_res;
 }
 
-static int eval_condition(IOPlayingContext *log_ctx,const char *cond,EventContent *event)
+static int eval_condition(IOPlayingContext *log_ctx,const char *cond,IOPlayingGlobal *gbl)
 {
     const char *ori_cond=cond;
     char *argv[16];
@@ -321,7 +296,7 @@ static int eval_condition(IOPlayingContext *log_ctx,const char *cond,EventConten
         }
         cond++;
     }
-    res=eval_condition_args(log_ctx,event,argv[0],argv+1,argc-1);
+    res=eval_condition_args(log_ctx,gbl,argv[0],argv+1,argc-1);
     
 end:
     for(int i=0;i<argc;i++)
@@ -378,7 +353,6 @@ static const char *const out_value_expr_var_names[]=
     "mods_ctrl",
     "mods_shift",
     "mods_alt",
-    "double_click",
     "once",
     
     /*var_dict elements will be added dynamically*/
@@ -406,7 +380,6 @@ enum out_value_expr_var_index
     VAR_MODS_CTRL,
     VAR_MODS_SHIFT,
     VAR_MODS_ALT,
-    VAR_DOUBLE_CLICK,
     VAR_ONCE,
     VAR_NUMBER,
 };
@@ -449,27 +422,26 @@ static double strtod_silent(const char *str)
     }
     return val;
 }
-static void fill_event_vars(double *vars,EventContent *event)
+static void fill_event_vars(double *vars,IOPlayingGlobal *gbl)
 {
-    vars[VAR_SCR_H]=event->window_h;
-    vars[VAR_SCR_W]=event->window_w;
-    vars[VAR_X]=event->mouse_x;
-    vars[VAR_Y]=event->mouse_y;
-    vars[VAR_MOUSE_LEFT]=event->mouse_lbutton;
-    vars[VAR_MOUSE_RIGHT]=event->mouse_rbutton;
-    vars[VAR_MOUSE_MIDDLE]=event->mouse_mbutton;
-    vars[VAR_MODS_CTRL]=event->mod_ctrl;
-    vars[VAR_MODS_SHIFT]=event->mod_shift;
-    vars[VAR_MODS_ALT]=event->mod_alt;
-    vars[VAR_DOUBLE_CLICK]=event->dbl_click;
-    vars[VAR_ONCE]=event->once;
+    vars[VAR_SCR_H]           = gbl->window_h;
+    vars[VAR_SCR_W]           = gbl->window_w;
+    vars[VAR_X]               = gbl->mouse.x;
+    vars[VAR_Y]               = gbl->mouse.y;
+    vars[VAR_MOUSE_LEFT]      = gbl->mouse.left;
+    vars[VAR_MOUSE_RIGHT]     = gbl->mouse.right;
+    vars[VAR_MOUSE_MIDDLE]    = gbl->mouse.middle;
+    vars[VAR_MODS_CTRL]       = gbl->keyboard.mod_ctrl;
+    vars[VAR_MODS_SHIFT]      = gbl->keyboard.mod_shift;
+    vars[VAR_MODS_ALT]        = gbl->keyboard.mod_alt;
+    vars[VAR_ONCE]            = gbl->once;
 }
 
 static double key_func_warp(void *c0,double keycode)
 {
     output_value_expr_expansion_context *ctx=c0;
-    
-    return get_key_status(&ctx->io->event,keycode);
+    KeyboardStatus *kb=&ctx->io->global.keyboard;
+    return kb->keystatus_getter(kb->opaque,keycode);
 }
 
 static const char *output_value_expr_f1_names[]=
@@ -490,7 +462,7 @@ static void fill_expansion_context(output_value_expr_expansion_context *ctx)
     ctx->pts=((ctx->frm->pts==AV_NOPTS_VALUE)?NAN:(ctx->frm->pts*av_q2d(ctx->inlink->time_base)));
     ctx->frame_number=ff_inl->frame_count_out+ctx->io->start_number;
     
-    AVDictionary *var_dict=*ctx->io->var_dict;
+    AVDictionary *var_dict=*ctx->io->global.var_dict;
     ctx->nb_var_from_dict=av_dict_count(var_dict);
     int nb_var=VAR_NUMBER+ctx->nb_var_from_dict;
     void *var_names_ptr=av_malloc(sizeof(char*)*(nb_var+1));
@@ -511,7 +483,7 @@ static void fill_expansion_context(output_value_expr_expansion_context *ctx)
     var_vals[VAR_T]=ctx->pts;
     var_vals[VAR_PICT_TYPE]=ctx->frm->pict_type;
     var_vals[VAR_DURATION]=ctx->frm->duration*av_q2d(inlink->time_base);
-    fill_event_vars(var_vals,&ctx->io->event);
+    fill_event_vars(var_vals,&ctx->io->global);
     var_vals[nb_var]=0;
 
     int i=VAR_NUMBER;
@@ -535,109 +507,16 @@ static void free_expansion_context(output_value_expr_expansion_context *ctx)
     av_freep(&ctx->var_values);
 }
 
-static void out_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expr_prep_keyname(void *c0,void *log_ctx,AVBPrint *bp,const char* func_name,const char *args)
 {
     output_value_expr_expansion_context *ctx=c0;
-    
-    av_bprintf(bp,"%c",av_get_picture_type_char(ctx->frm->pict_type));
-}
-static void out_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
-{
-    output_value_expr_expansion_context *ctx=c0;
-    
-    const char *fmt;
-    const char *strftime_fmt = NULL;
-    const char *delta = NULL;
-    double pts = ctx->pts;
-    
-    // argv: [FMT, [DELTA, 24HH | strftime_fmt]]
-    
-    fmt=((argc>=1)?argv[0]:"flt");
-    if(argc>=2)
-    {
-        delta=argv[1];
-    }
-    if(argc>=3)
-    {
-        if(strcmp(fmt,"hms")==0)
-        {
-            if(strcmp(argv[2], "24HH")==0)
-            {
-                av_log(ctx->io,AV_LOG_WARNING,"pts third argument 24HH is deprecated, use pts:hms24hh instead\n");
-                fmt="hms24";
-            }
-            else
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"Invalid argument '%s', '24HH' was expected\n",argv[2]);
-                return;
-            }
-        }
-        else
-        {
-            strftime_fmt=argv[2];
-        }
-    }
-    
-    int res=ff_print_pts(ctx->io, bp, pts, delta, fmt, strftime_fmt);
-    if(res<0)
-    {
-        av_log(ctx->io,AV_LOG_ERROR,"Failed to print pts, funcname=%s,pts=%f,delta=%s,fmt=%s,strftime_fmt=%s\n",name,pts,delta,fmt,strftime_fmt);
-    }
-}
-static void out_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
-{
-    output_value_expr_expansion_context *ctx=c0;
-    
-    av_bprintf(bp,"%d",ctx->frame_number);
-}
-static void out_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
-{
-    output_value_expr_expansion_context *ctx=c0;
-    char *metakey=argv[0];
-    char *defval=NULL;
-    if(argc>=2)
-        defval=argv[1];
-    
-    AVDictionaryEntry *e=av_dict_get(ctx->frm->metadata,metakey,NULL,0);
-    
-    if (e&&e->value)
-        av_bprintf(bp,"%s",e->value);
-    else if(defval)
-        av_bprintf(bp,"%s",defval);
-}
-static void out_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
-{
-    output_value_expr_expansion_context *ctx=c0;
-    const char *strftime_fmt = argc ? argv[0] : NULL;
-    
-    int res=ff_print_time(ctx->io,bp,strftime_fmt,strcmp(name,"localtime")==0);
-    if(res<0)
-    {
-        av_log(ctx->io,AV_LOG_ERROR,"Failed to print time, funcname=%s,strftime_fmt=%s\n",name,strftime_fmt);
-    }
-}
-
-typedef struct
-{
-    const char *name;
-    void (*prep)(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
-}expr_prep_func_entry;
-static void expr_prep_keyname(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
-static void expr_prep_metadata_call(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* name,const char *args);
-
-static const expr_prep_func_entry prep_func_table[]=
-{
-    {"key",         expr_prep_keyname          },
-    {"metadata",    expr_prep_metadata_call    }
-};
-
-
-static void expr_prep_keyname(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* func_name,const char *args)
-{
     const char *keyname=args;
+    if(!check_keyboard_interface(ctx->io,&ctx->io->global))
+        return;
     
+    KeyboardStatus *kb=&ctx->io->global.keyboard;
     int valid_key=0,keycode=0;
-    keycode_from_name(ctx->io,&(ctx->io->event),keyname,&valid_key,&keycode);
+    kb->keyname_mapper(keyname,&valid_key,&keycode);
     
     if(!valid_key)
     {
@@ -647,8 +526,9 @@ static void expr_prep_keyname(output_value_expr_expansion_context *ctx,AVBPrint 
     
     av_bprintf(bp,"%s(%d)",func_name,keycode);
 }
-static void expr_prep_metadata_call(output_value_expr_expansion_context *ctx,AVBPrint *bp,const char* func_name,const char *args)
+static void expr_prep_metadata_call(void *c0,void *log_ctx,AVBPrint *bp,const char* func_name,const char *args)
 {
+    output_value_expr_expansion_context *ctx=c0;
     char *metakey=av_get_token(&args,",");
     char *defval=NULL;
     if(*args==',')
@@ -671,96 +551,23 @@ static void expr_prep_metadata_call(output_value_expr_expansion_context *ctx,AVB
     av_freep(&defval);
 }
 
-
-
-
-
-
-static void skip_whitespace(const char **expr)
+static FFExprPreprocer prep_func_table[]=
 {
-    while (*expr && av_isspace(**expr)) {
-        (*expr)++;
-    }
-}
-static int match_do_prep_funcs(output_value_expr_expansion_context *ctx,const char **expr,AVBPrint *bp)
-{
-    int nb_prep_func=FF_ARRAY_ELEMS(prep_func_table);
-    int matched=0;
-    
-    for(int i=0;i<nb_prep_func;i++)
-    {
-        const char *func_name=prep_func_table[i].name;
-        int func_len=strlen(func_name);
-        
-        if(strncmp(*expr,func_name,func_len)==0)
-        {
-            matched=1;
-            (*expr)+=func_len;
-            
-            skip_whitespace(expr); // 先跳过括号前的空白
-            if(**expr!='(')
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess: Expected '(' after '%s' near '%s'\n",func_name,*expr);
-                goto fail;
-            }
-            (*expr)++; // 跳过左括号
-            
-            char *args_tk=av_get_token(expr,")");
-            if(!args_tk||*args_tk=='\0'||**expr!=')')
-            {
-                av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess:Unmatched '(' or invalid arguments in %s() function near '%s'\n",func_name,*expr);
-                av_freep(&args_tk);
-                goto fail;
-            }
-            (*expr)++;// 跳过右括号
-            
-            prep_func_table[i].prep(ctx,bp,func_name,args_tk);
-            av_freep(&args_tk);
-            
-            break;
-        }
-    }
-    
-    return matched;
-fail:
-    return -1;
-}
-static const char* expr_preprocess(output_value_expr_expansion_context *ctx,const char *expr)
-{
-    AVBPrint *bp=&ctx->io->output_expr_prep;
-    av_bprint_clear(bp);
-    
-    
-    while(*expr)
-    {
-        int matched=match_do_prep_funcs(ctx,&expr,bp);
-        if(matched<0)
-        {
-            goto fail;
-        }
-        if(!matched)
-        {
-            av_bprint_chars(bp,*expr,1);
-            expr++;
-        }
-    }
-    
-    if(!av_bprint_is_complete(bp))
-    {
-        av_log(ctx->io,AV_LOG_ERROR,"Expr preprocess buffer overflow\n");
-        goto fail;
-    }
-    
-    return bp->str;
-    
-fail:
-    av_bprint_clear(bp);
-    return "";
-}
+    {"key",         expr_prep_keyname          },
+    {"metadata",    expr_prep_metadata_call    }
+};
 
 static double do_eval_expr(output_value_expr_expansion_context *ctx,const char *ori_expr)
 {
-    const char *expr=expr_preprocess(ctx,ori_expr);
+    FFExprPrepContext prep_ctx=
+    {
+        .opaque=ctx,
+        .log_ctx=ctx->io,
+        .bp=&ctx->io->output_expr_prep,
+        .funcs=prep_func_table,
+        .nb_funcs=FF_ARRAY_ELEMS(prep_func_table)
+    };
+    const char *expr=ff_expr_preprocess(&prep_ctx,ori_expr);
     
     AVExpr *expr_tree=NULL;
     
@@ -780,84 +587,50 @@ static double do_eval_expr(output_value_expr_expansion_context *ctx,const char *
     return value;
 }
 
+
+static void out_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    output_value_expr_expansion_context *ctx=c0;
+    ff_expand_func_pict_type(ctx->io,ctx->frm,bp,name,argv,argc);
+}
+static void out_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    output_value_expr_expansion_context *ctx=c0;
+    ff_expand_func_pts(ctx->io,ctx->pts,bp,name,argv,argc);
+}
+static void out_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    output_value_expr_expansion_context *ctx=c0;
+    ff_expand_func_frame_num(ctx->io,ctx->frame_number,bp,name,argv,argc);
+}
+static void out_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    output_value_expr_expansion_context *ctx=c0;
+    ff_expand_func_metadata(ctx->io,ctx->frm,bp,name,argv,argc);
+}
+static void out_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+{
+    output_value_expr_expansion_context *ctx=c0;
+    ff_expand_func_strftime(ctx->io,bp,name,argv,argc);
+}
 static void out_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
-    
     double value=do_eval_expr(ctx,argv[0]);
-    av_bprintf(bp, "%f", value);
+    ff_expand_func_eval_expr(ctx->io,value,bp,name,argv,argc);
 }
 static void out_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
-    
-    char *expr=argv[0];
-    char format=argv[1][0];
-    int positions = -1;
-    
-    /*
-    * argv[0] expression to be converted to `int`
-    * argv[1] format: 'x', 'X', 'd' or 'u'
-    * argv[2] positions printed (optional)
-    */
-    
-    if(argc==3)
-    {
-        int ret=sscanf(argv[2],"%u",&positions);
-        if(ret!= 1)
-        {
-            av_log(ctx,AV_LOG_ERROR,"expr_int_format(): Invalid number of positions to print: '%s'\n", argv[2]);
-            return;
-        }
-    }
-    
-    double value=do_eval_expr(ctx,expr);
-    
-    if (!strchr("xXdu", format))
-    {
-        av_log(ctx->io, AV_LOG_ERROR, "Invalid format '%c' specified,"
-               " allowed values: 'x', 'X', 'd', 'u'\n", format);
-        return;
-    }
-    
-    feclearexcept(FE_ALL_EXCEPT);
-    int intval=value;
-#if defined(FE_INVALID) && defined(FE_OVERFLOW) && defined(FE_UNDERFLOW)
-    int fetestexcept_ret;
-    if ((fetestexcept_ret =fetestexcept(FE_INVALID|FE_OVERFLOW|FE_UNDERFLOW)))
-    {
-        av_log(ctx->io, AV_LOG_ERROR, "Conversion of floating-point result to int failed. Control register: 0x%08x. Conversion result: %d\n", fetestexcept_ret, intval);
-        return;
-    }
-#endif
-    char fmt_str[30] = "%";
-    
-    if (positions >= 0)
-        av_strlcatf(fmt_str, sizeof(fmt_str), "0%u", positions);
-    av_strlcatf(fmt_str, sizeof(fmt_str), "%c", format);
-    
-    av_log(ctx->io, AV_LOG_DEBUG, "Formatting value %f (expr '%s') with spec '%s'\n",
-           value, expr, fmt_str);
-    
-    av_bprintf(bp, fmt_str, intval);
+    double value=do_eval_expr(ctx,argv[0]);
+    ff_expand_func_eval_expr_int_fmt(ctx->io,value,bp,name,argv,argc);
 }
 static void out_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
-    
-    char *expr=argv[0];
-    char *true_str=argv[1];
-    char *false_str=NULL;
-    if(argc>=3)
-        false_str=argv[2];
-    
-    double value=do_eval_expr(ctx,expr);
-    if(value!=0)
-        av_bprintf(bp,"%s",true_str);
-    else if(false_str)
-        av_bprintf(bp,"%s",false_str);
+    double value=do_eval_expr(ctx,argv[0]);
+    ff_expand_func_if(ctx->io,value,bp,name,argv,argc);
 }
-
 
 static void do_expand_function(output_value_expr_expansion_context *ctx,AVBPrint *bp,char *name,char **argv,int argc)
 {    
@@ -946,7 +719,7 @@ static char *expand_value_expr(const char *value_expr,output_value_expr_expansio
     }
     if (!av_bprint_is_complete(bp))
     {
-        av_log(ctx->io,AV_LOG_ERROR,"av_get_token failed because of onmem\n");
+        av_log(ctx->io,AV_LOG_ERROR,"bprint failed because of onmem\n");
     }
     
     return bp->str;
@@ -1054,7 +827,7 @@ static void output_to_print(output_value_expr_expansion_context *ctx,char *,char
 }
 static void output_to_variable(output_value_expr_expansion_context *ctx,char *key,char *val)
 {
-    av_dict_set(ctx->io->var_dict,key,val,0);
+    av_dict_set(ctx->io->global.var_dict,key,val,0);
 }
 
 static void handle_output(AVFilterLink *inlink,AVFrame *frm,int type,char **output_key,char **output_value)
@@ -1082,14 +855,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
 	AVFilterContext *ctx = inlink->dst;
 	IOPlayingContext *ioctx=ctx->priv;
-    if(!ioctx->event.window_w)
+    if(!ioctx->global.window_w)
     {
         av_log(ioctx, AV_LOG_DEBUG, 
                "context not initialized,do nothing\n");
         return ff_filter_frame(ctx->outputs[0], frame);
     }
     
-    if(eval_condition(ioctx,ioctx->cond_expr,&ioctx->event))
+    if(eval_condition(ioctx,ioctx->cond_expr,&ioctx->global))
     {
         av_log(ioctx, AV_LOG_DEBUG, 
                "ioplaying triggered cond=%s, out=%s\n",ioctx->cond_expr,ioctx->out_expr);
@@ -1113,7 +886,7 @@ static const AVOption ioplaying_options[]=
 {
 	{ "cond",            "condition to toggle the output",                       OFFSET(cond_expr),    AV_OPT_TYPE_STRING, { .str="never" },       0, 0,       FLAGS },
 	{ "out",             "the output action when the condition is satisfied",    OFFSET(out_expr),     AV_OPT_TYPE_STRING, { .str="nop="  },       0, 0,       FLAGS },
-    { "start_number",    "start frame number for n/frame_num variable",          OFFSET(start_number), AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS},
+    { "start_number",    "start frame number for n/frame_num variable",          OFFSET(start_number), AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS },
 	{ NULL }
 };
 

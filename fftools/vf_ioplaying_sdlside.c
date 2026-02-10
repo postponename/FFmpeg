@@ -1,14 +1,27 @@
 #include"ioplaying_sdlside.h"
-void submit_key(EventContent *content,SDL_KeyboardEvent key,unsigned char val);
-void submit_button(EventContent *content,SDL_MouseButtonEvent button,int val);
 
-static int get_key_from_name(const char* name)
+static void get_key_from_name(const char* name,int *is_valid,int *code)
 {
-    return SDL_GetKeyFromName(name);
+    int keycode=SDL_GetKeyFromName(name);
+    if(keycode==SDLK_UNKNOWN)
+    {
+        *is_valid=0;
+        return;
+    }
+    *is_valid=1;
+    *code=keycode;
 }
-static int keycode_checker(int keycode)
+
+static int keystatus_getter(void *c0,int code)
 {
-    return keycode!=SDLK_UNKNOWN;
+    keystatus_getter_context *ctx=c0;
+    SDL_LockMutex(ctx->mutex);
+    unsigned char status=0;
+    int res=ff_hashtable_get(ctx->map,&code,&status);
+    SDL_UnlockMutex(ctx->mutex);
+    if(!res)
+        status=0;
+    return status;
 }
 static int from_sdlkeycode_to_ioplaying(SDL_Keycode code)
 {
@@ -19,49 +32,54 @@ void event_warpper_init(EventWarpper *warp)
 {
     av_log(NULL, AV_LOG_DEBUG,"event_warpper_init=warp=%p\n",(void*)warp);
     memset(warp,0,sizeof(EventWarpper));
-    ff_hashtable_alloc(&warp->content.key_state_map,sizeof(int),1,256);
-    warp->content.keyname_mapper=get_key_from_name;
-    warp->content.keycode_checker=keycode_checker;
-    warp->var_dict=NULL;//Empty dictionary
-    warp->content.once=1;
     warp->mutex=SDL_CreateMutex();
+    
+    warp->key_status.mutex=SDL_CreateMutex();
+    ff_hashtable_alloc(&warp->key_status.map,sizeof(int),1,512);
+    
+    warp->global.keyboard.keyname_mapper=get_key_from_name;
+    warp->global.keyboard.opaque=&warp->key_status;
+    warp->global.keyboard.keystatus_getter=keystatus_getter;
+    warp->var_dict=NULL;//Empty dictionary
+    warp->global.var_dict=&warp->var_dict;
+    warp->global.once=1;
 }
 
 void event_warpper_uninit(EventWarpper *warp)
 {
     av_log(NULL, AV_LOG_DEBUG,"event_warpper_uninit=warp=%p\n",(void*)warp);
-    ff_hashtable_freep(&warp->content.key_state_map);
-    warp->content.key_state_map=NULL;
-    SDL_DestroyMutex(warp->mutex);
+    ff_hashtable_freep(&warp->key_status.map),warp->key_status.map=NULL;
     av_dict_free(&warp->var_dict);
-    warp->mutex=NULL;
+    SDL_DestroyMutex(warp->mutex),warp->mutex=NULL;
 }
 
-void submit_key(EventContent *content,SDL_KeyboardEvent key,unsigned char val)
+static void submit_key(EventWarpper *warp,SDL_KeyboardEvent key,unsigned char val)
 {
     SDL_Keycode sym=key.keysym.sym;
+    KeyboardStatus *kb=&warp->global.keyboard;
     int keycode=from_sdlkeycode_to_ioplaying(sym);
-    ff_hashtable_set(content->key_state_map,&keycode,&val);
-    content->mod_ctrl=((key.keysym.mod&KMOD_CTRL)!=0);
-    content->mod_alt=((key.keysym.mod&KMOD_ALT)!=0);
-    content->mod_shift=((key.keysym.mod&KMOD_SHIFT)!=0);
+    SDL_LockMutex(warp->key_status.mutex);
+    ff_hashtable_set(warp->key_status.map,&keycode,&val);
+    SDL_UnlockMutex(warp->key_status.mutex);
+    kb->mod_ctrl=((key.keysym.mod&KMOD_CTRL)!=0);
+    kb->mod_alt=((key.keysym.mod&KMOD_ALT)!=0);
+    kb->mod_shift=((key.keysym.mod&KMOD_SHIFT)!=0);
 }
-void submit_button(EventContent *content,SDL_MouseButtonEvent button,int val)
+static void submit_button(MouseStatus *ms,SDL_MouseButtonEvent button,int val)
 {
     if(button.button==SDL_BUTTON_LEFT)
-        content->mouse_lbutton=val;
+        ms->left=val;
     if(button.button==SDL_BUTTON_RIGHT)
-        content->mouse_rbutton=val;
+        ms->right=val;
     if(button.button==SDL_BUTTON_MIDDLE)
-        content->mouse_mbutton=val;
-    content->mouse_x=button.x;
-    content->mouse_x=button.y;
-    content->dbl_click=(button.clicks==2);
+        ms->middle=val;
+    ms->x=button.x;
+    ms->y=button.y;
 }
 void submit_size_event(EventWarpper* warp,int w,int h)
 {
-    warp->content.window_w=w;
-    warp->content.window_h=h;
+    warp->global.window_w=w;
+    warp->global.window_h=h;
 }
 void submit_event(EventWarpper* warp,SDL_Event event)
 {
@@ -71,12 +89,12 @@ void submit_event(EventWarpper* warp,SDL_Event event)
     {
     case SDL_KEYDOWN:
     {
-        submit_key(&warp->content,event.key,1);
+        submit_key(warp,event.key,1);
         break;
     }
     case SDL_KEYUP:
     {
-        submit_key(&warp->content,event.key,0);
+        submit_key(warp,event.key,0);
         break;
     }
     case SDL_MOUSEMOTION:
@@ -85,21 +103,22 @@ void submit_event(EventWarpper* warp,SDL_Event event)
         int lb=event.motion.state&SDL_BUTTON_LMASK;
         int rb=event.motion.state&SDL_BUTTON_RMASK;
         int mb=event.motion.state&SDL_BUTTON_MMASK;
-        warp->content.mouse_x=x;
-        warp->content.mouse_y=y;
-        warp->content.mouse_lbutton=(lb!=0);
-        warp->content.mouse_rbutton=(rb!=0);
-        warp->content.mouse_mbutton=(mb!=0);
+        MouseStatus *ms=&warp->global.mouse;
+        ms->x         = x;
+        ms->y         = y;
+        ms->left      = (lb!=0);
+        ms->right     = (rb!=0);
+        ms->middle    = (mb!=0);
         break;
     }
     case SDL_MOUSEBUTTONDOWN:
     {
-        submit_button(&warp->content,event.button,1);
+        submit_button(&warp->global.mouse,event.button,1);
         break;
     }
     case SDL_MOUSEBUTTONUP:
     {
-        submit_button(&warp->content,event.button,0);
+        submit_button(&warp->global.mouse,event.button,0);
         break;
     }
     }
@@ -117,17 +136,21 @@ void fill_ioplaying(EventWarpper* warp,AVFilterGraph *graph,AVFrame *frm)
         if(strcmp(fi->filter->name,"ioplaying")==0)
         {
             IOPlayingContext *iopctx=fi->priv;
-            iopctx->event=warp->content;
-            iopctx->var_dict=&warp->var_dict;
+            iopctx->global=warp->global;
 //            printf("fill_ioplaying hit ioplaying=index_in_graph=%d:iopctx=%p\n",i,iopctx);
+        }
+        if(strcmp(fi->filter->name,"indirect")==0)
+        {
+            IndirectContext *indctx=fi->priv;
+            indctx->ioplaying_global=warp->global;
         }
     }
     
-    if(warp->content.window_w)
+    if(warp->global.window_w)
     {
-        if(warp->content.once)
+        if(warp->global.once)
         {
-            warp->content.once=0;
+            warp->global.once=0;
         }
     }
     SDL_UnlockMutex(warp->mutex);

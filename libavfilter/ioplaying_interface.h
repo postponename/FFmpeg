@@ -6,21 +6,32 @@
 #include "libavutil/bprint.h"
 #include "libavutil/mem.h"
 
-typedef struct EventContent
+typedef struct
+{
+    int x,y;
+    int left,right,middle;
+    
+}MouseStatus;
+
+typedef struct
+{
+    int mod_ctrl,mod_alt,mod_shift;
+    
+    void (*keyname_mapper)(const char* name,int *is_valid,int *code);
+    
+    void *opaque;
+    int (*keystatus_getter)(void *opa,int code);
+    
+}KeyboardStatus;
+
+typedef struct
 {
     int window_w,window_h;
     int once;
-    
-    int mouse_x,mouse_y;
-    int mouse_lbutton,mouse_rbutton,mouse_mbutton;
-    int dbl_click;
-    
-    int mod_ctrl,mod_alt,mod_shift;
-    int (*keyname_mapper)(const char*);
-    int (*keycode_checker)(int);
-    FFHashtableContext *key_state_map;
-    
-}EventContent;
+    MouseStatus mouse;
+    KeyboardStatus keyboard;
+    AVDictionary **var_dict;
+}IOPlayingGlobal;
 
 typedef struct IOPlayingContext
 {
@@ -32,8 +43,21 @@ typedef struct IOPlayingContext
     AVBPrint expanded_out;
     AVBPrint output_expr_prep;
     
-    EventContent event;
-    AVDictionary **var_dict;
+    IOPlayingGlobal global;
+    
 }IOPlayingContext;
 
+typedef struct IndirectContext
+{
+    const AVClass *class;
+    
+    char *cond_expr,*vf_desc;
+    int start_number;
+    int wait_ioplaying;
+    
+    AVBPrint expr_prep;
+    AVBPrint vf_desc_expand;
+    
+    IOPlayingGlobal ioplaying_global;
+}IndirectContext;
 #endif
