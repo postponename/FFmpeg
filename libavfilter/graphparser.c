@@ -335,6 +335,175 @@ fail:
     return ret;
 }
 
+
+#define WHITESPACES " \n\t\r"
+
+//the no-content-modifing version of av_get_token[avstring.c:143],and reserves  all '
+static char *get_token_plain(const char **buf, const char *term)
+{
+    char *out     = av_realloc(NULL, strlen(*buf) + 1);
+    char *ret     = out, *end = out;
+    const char *p = *buf;
+    if (!out)
+        return NULL;
+    p += strspn(p, WHITESPACES);
+    
+    while (*p && !strspn(p, term))
+    {
+        char c = *p++;
+        if (c=='\\'&&*p)
+        {
+            *out++ = '\\';
+            *out++ = *p++;
+        }
+        else if (c == '\'')
+        {
+            *out++ = '\'';
+            while (*p && *p != '\'')
+                *out++ = *p++;
+            if (*p)
+            {
+                *out++ = '\'';
+                p++;
+                end = out;
+            }
+        } else {
+            *out++ = c;
+        }
+    }
+    
+    do
+        *out-- = 0;
+    while (out >= end && strspn(out, WHITESPACES));
+    
+    *buf = p;
+    
+    char *small_ret = av_realloc(ret, out - ret + 2);
+    return small_ret ? small_ret : ret;
+}
+
+#define WHITESPACES " \n\t\r"
+
+static int is_key_char(char c)
+{
+    return (unsigned)((c | 32) - 'a') < 26 ||
+    (unsigned)(c - '0') < 10 ||
+    c == '-' || c == '_' || c == '/' || c == '.';
+}
+
+/**
+ * Copy from get_key[opt.c:1854]
+ *
+ * Read a key from a string.
+ *
+ * The key consists of is_key_char characters and must be terminated by a
+ * character from the delim string; spaces are ignored.
+ *
+ * @return  0 for success (even with ellipsis), <0 for failure
+ */
+static int get_key(const char **ropts, const char *delim, char **rkey)
+{
+    const char *opts = *ropts;
+    const char *key_start, *key_end;
+    
+    key_start = opts += strspn(opts, WHITESPACES);
+    while (is_key_char(*opts))
+        opts++;
+    key_end = opts;
+    opts += strspn(opts, WHITESPACES);
+    if (!*opts || !strchr(delim, *opts))
+        return AVERROR(EINVAL);
+    opts++;
+    if (!(*rkey = av_malloc(key_end - key_start + 1)))
+        return AVERROR(ENOMEM);
+    memcpy(*rkey, key_start, key_end - key_start);
+    (*rkey)[key_end - key_start] = 0;
+    *ropts = opts;
+    return 0;
+}
+
+//the nonescape version of av_opt_get_key_value[opt.c:1875]
+static int opt_key_value_nonescape(const char **ropts,
+                         const char *key_val_sep, const char *pairs_sep,
+                         unsigned flags,
+                         char **rkey, char **rval)
+{
+    int ret;
+    char *key = NULL, *val;
+    const char *opts = *ropts;
+    
+    if ((ret = get_key(&opts, key_val_sep, &key)) < 0 &&
+        !(flags & AV_OPT_FLAG_IMPLICIT_KEY))
+        return AVERROR(EINVAL);
+    if (!(val = get_token_plain(&opts, pairs_sep))) {
+        av_free(key);
+        return AVERROR(ENOMEM);
+    }
+    *ropts = opts;
+    *rkey  = key;
+    *rval  = val;
+    return 0;
+}
+
+//the nonescape version of ff_filter_opt_parse[avfilter.c:852]
+static int filter_opt_parse_nonescape(void *logctx, const AVClass *priv_class, AVDictionary **options, const char *args)
+{
+    const AVOption *o = NULL;
+    int ret;
+    int offset= -1;
+    
+    if (!args)
+        return 0;
+    
+    while (*args) {
+        char *parsed_key, *value;
+        const char *key;
+        const char *shorthand = NULL;
+        int additional_flags  = 0;
+        
+        if (priv_class && (o = av_opt_next(&priv_class, o))) {
+            if (o->type == AV_OPT_TYPE_CONST || o->offset == offset)
+                continue;
+            offset = o->offset;
+            shorthand = o->name;
+        }
+        
+        ret = opt_key_value_nonescape(&args, "=", ":",
+                                   shorthand ? AV_OPT_FLAG_IMPLICIT_KEY : 0,
+                                   &parsed_key, &value);
+        if (ret < 0) {
+            if (ret == AVERROR(EINVAL))
+                av_log(logctx, AV_LOG_ERROR, "No option name near '%s'\n", args);
+            else
+                av_log(logctx, AV_LOG_ERROR, "Unable to parse '%s': %s\n", args,
+                       av_err2str(ret));
+            return ret;
+        }
+        if (*args)
+            args++;
+        if (parsed_key) {
+            key = parsed_key;
+            additional_flags = AV_DICT_DONT_STRDUP_KEY;
+            priv_class = NULL; /* reject all remaining shorthand */
+        } else {
+            key = shorthand;
+        }
+        
+        av_log(logctx, AV_LOG_DEBUG, "Setting '%s' to value '%s'\n", key, value);
+        
+        const char *key_temp=key,*value_temp=value;
+        char *key_ue=av_get_token(&key_temp,"");
+        char *value_ue=av_get_token(&value_temp,"");
+        av_freep(&key);
+        av_freep(&value);
+        
+        av_dict_set(options, key_ue, value_ue,
+                    additional_flags | AV_DICT_DONT_STRDUP_VAL | AV_DICT_MULTIKEY);
+    }
+    
+    return 0;
+}
+
 static int filter_parse(void *logctx, const char **filter,
                         AVFilterParams **pp)
 {
@@ -372,15 +541,14 @@ static int filter_parse(void *logctx, const char **filter,
 
         (*filter)++;
 
-        opts = av_get_token(filter, "[],;");
+        opts = get_token_plain(filter, "[],;");
         if (!opts) {
             ret = AVERROR(ENOMEM);
             goto fail;
         }
-
-        ret = ff_filter_opt_parse(logctx, f ? f->priv_class : NULL,
+        
+        ret = filter_opt_parse_nonescape(logctx, f ? f->priv_class : NULL,
                                   &p->opts, opts);
-        av_freep(&opts);
         if (ret < 0)
             goto fail;
     }

@@ -50,14 +50,13 @@ void ff_expand_func_frame_num(void *log_ctx,int frame_num,AVBPrint *bp,const cha
 {
     av_bprintf(bp,"%d",frame_num);
 }
-void ff_expand_func_metadata(void *log_ctx,AVFrame *frm,AVBPrint *bp,const char *name,char **argv,int argc)
+void ff_expand_func_metadata(void *log_ctx,AVFrame *frm,const char *key,AVBPrint *bp,const char *name,char **argv,int argc)
 {
-    char *metakey=argv[0];
     char *defval=NULL;
     if(argc>=2)
         defval=argv[1];
     
-    AVDictionaryEntry *e=av_dict_get(frm->metadata,metakey,NULL,0);
+    AVDictionaryEntry *e=av_dict_get(frm->metadata,key,NULL,0);
     
     if (e&&e->value)
         av_bprintf(bp,"%s",e->value);

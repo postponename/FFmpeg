@@ -13,7 +13,7 @@
 #include "filters.h"
 #include "video.h"
 #include "textutils.h"
-#include "ioplaying_interface.h"
+#include "iipo_interface.h"
 #include "exprpreputil.h"
 #include "textexpandutil.h"
 #include <math.h>
@@ -606,7 +606,7 @@ static void out_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **arg
 static void out_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     output_value_expr_expansion_context *ctx=c0;
-    ff_expand_func_metadata(ctx->io,ctx->frm,bp,name,argv,argc);
+    ff_expand_func_metadata(ctx->io,ctx->frm,argv[0],bp,name,argv,argc);
 }
 static void out_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {

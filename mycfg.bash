@@ -18,4 +18,6 @@ cd /e/ffmpeg-custom
   --enable-libharfbuzz \
   --enable-libmp3lame \
   --enable-libopus \
-  --enable-debug=2
+  --enable-debug=3 \
+  --disable-optimizations\
+  

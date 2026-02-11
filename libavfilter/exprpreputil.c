@@ -7,14 +7,6 @@
 #include "libavutil/bprint.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/parseutils.h"
-#include "libavutil/detection_bbox.h"
-#include "libavutil/mem.h"
-#include "libavfilter/buffersrc.h"
-#include "libavfilter/buffersink.h"
-#include "avfilter.h"
-#include "filters.h"
-#include "video.h"
-#include "ioplaying_interface.h"
 #include "textutils.h"
 #include <math.h>
 #include <fenv.h>

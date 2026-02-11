@@ -1,7 +1,7 @@
 #ifndef IOPLAYING_SDLSIDE
 #define IOPLAYING_SDLSIDE
 #include "libavfilter/avfilter.h"
-#include "libavfilter/ioplaying_interface.h"
+#include "libavfilter/iipo_interface.h"
 #include<SDL.h>
 #include<SDL_thread.h>
 typedef struct keystatus_getter_context

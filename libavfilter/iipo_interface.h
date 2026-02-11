@@ -1,5 +1,5 @@
-#ifndef IOPLAYING_INTERFACE
-#define IOPLAYING_INTERFACE
+#ifndef IIPO_INTERFACE_H
+#define IIPO_INTERFACE_H
 #include "avfilter.h"
 #include "libavcodec/hashtable.h"
 #include "libavutil/eval.h"
@@ -60,4 +60,21 @@ typedef struct IndirectContext
     
     IOPlayingGlobal ioplaying_global;
 }IndirectContext;
+
+typedef struct PlaycallGlobal
+{
+    int window_w,window_h;
+}PlaycallGlobal;
+
+typedef struct PlaycallContext
+{
+    const AVClass *class;
+
+    char *cond_expr,*call_expr;
+    int start_number;
+    int req_ioplaying;
+    
+    
+    PlaycallGlobal global;
+}PlaycallContext;
 #endif

@@ -14,7 +14,7 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
-#include "ioplaying_interface.h"
+#include "iipo_interface.h"
 #include "textutils.h"
 #include "exprpreputil.h"
 #include "textexpandutil.h"
@@ -260,7 +260,9 @@ static void vfdesc_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **
 static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
-    ff_expand_func_metadata(ctx->ind,ctx->frm,bp,name,argv,argc);
+    const char *key_temp=argv[0];
+    char *metakey=av_get_token(&key_temp,"");
+    ff_expand_func_metadata(ctx->ind,ctx->frm,metakey,bp,name,argv,argc);
 }
 static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
@@ -270,19 +272,28 @@ static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **a
 static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
-    double value=do_eval_expr(ctx,argv[0]);
+    const char *expr_temp=argv[0];
+    char *expr=av_get_token(&expr_temp,"");
+    double value=do_eval_expr(ctx,expr);
+    av_freep(&expr);
     ff_expand_func_eval_expr(ctx->ind,value,bp,name,argv,argc);
 }
 static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
-    double value=do_eval_expr(ctx,argv[0]);
+    const char *expr_temp=argv[0];
+    char *expr=av_get_token(&expr_temp,"");
+    double value=do_eval_expr(ctx,expr);
+    av_freep(&expr);
     ff_expand_func_eval_expr_int_fmt(ctx->ind,value,bp,name,argv,argc);
 }
 static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
-    double value=do_eval_expr(ctx,argv[0]);
+    const char *expr_temp=argv[0];
+    char *expr=av_get_token(&expr_temp,"");
+    double value=do_eval_expr(ctx,expr);
+    av_freep(&expr);
     ff_expand_func_if(ctx->ind,value,bp,name,argv,argc);
 }
 
@@ -307,6 +318,53 @@ static void do_expand_function(indirect_expansion_context *ctx,AVBPrint *bp,char
     }
     
     vfdesc_func_table[func].expand(ctx,bp,name,argv,argc);
+}
+
+
+#define WHITESPACES " \n\t\r"
+
+//the no-content-modifing version of av_get_token[avstring.c:143],and reserves  all '
+static char *get_token_plain(const char **buf, const char *term)
+{
+    char *out     = av_realloc(NULL, strlen(*buf) + 1);
+    char *ret     = out, *end = out;
+    const char *p = *buf;
+    if (!out)
+        return NULL;
+    p += strspn(p, WHITESPACES);
+    
+    while (*p && !strspn(p, term))
+    {
+        char c = *p++;
+        if (c=='\\'&&*p)
+        {
+            *out++ = '\\';
+            *out++ = *p++;
+        }
+        else if (c == '\'')
+        {
+            *out++ = '\'';
+            while (*p && *p != '\'')
+                *out++ = *p++;
+            if (*p)
+            {
+                *out++ = '\'';
+                p++;
+                end = out;
+            }
+        } else {
+            *out++ = c;
+        }
+    }
+    
+    do
+        *out-- = 0;
+    while (out >= end && strspn(out, WHITESPACES));
+    
+    *buf = p;
+    
+    char *small_ret = av_realloc(ret, out - ret + 2);
+    return small_ret ? small_ret : ret;
 }
 static void expand_vf_desc_function(indirect_expansion_context *ctx,AVBPrint *bp,const char **pdesc)
 {
@@ -336,7 +394,7 @@ static void expand_vf_desc_function(indirect_expansion_context *ctx,AVBPrint *bp
     int argc=0;
     while(1)
     {
-        if(!(argv[argc++]=av_get_token(&desc, "|)")))
+        if(!(argv[argc++]=get_token_plain(&desc, "|)")))
         {
             av_log(ctx->ind,AV_LOG_ERROR,"av_get_token failed because of onmem\n");
             goto end;
@@ -587,7 +645,7 @@ static const AVFilterPad indirect_inputs[] =
 
 const FFFilter ff_vf_indirect = {
 	.p.name        = "indirect",
-	.p.description = NULL_IF_CONFIG_SMALL("Dummy filter indirect filter"),
+	.p.description = NULL_IF_CONFIG_SMALL("Dummy filter for indirect dynamical apply filter"),
 	.p.priv_class  = &indirect_class,
 	.p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
 	.priv_size     = sizeof(IndirectContext),
