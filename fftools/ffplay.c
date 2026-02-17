@@ -51,7 +51,7 @@
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersink.h"
 #include "libavfilter/buffersrc.h"
-#include "ioplaying_sdlside.h"
+#include "iipo_sdlside.h"
 
 #include <SDL.h>
 #include <SDL_thread.h>
@@ -304,7 +304,7 @@ typedef struct VideoState {
 
     SDL_cond *continue_read_thread;
 	
-	EventWarpper event_warpper;
+	IIPOWarpper iipo_warpper;
 } VideoState;
 
 /* options specified by the user */
@@ -1345,7 +1345,7 @@ static void stream_close(VideoState *is)
     if (is->sub_texture)
         SDL_DestroyTexture(is->sub_texture);
     
-    event_warpper_uninit(&is->event_warpper);
+    event_warpper_uninit(&is->iipo_warpper);
     av_free(is);
 }
 
@@ -1413,7 +1413,7 @@ static int video_open(VideoState *is)
     is->width  = w;
     is->height = h;
 
-    submit_size_event(&is->event_warpper,w,h);
+    submit_size_event(&is->iipo_warpper,w,h);
     return 0;
 }
 
@@ -1566,6 +1566,7 @@ static void toggle_pause(VideoState *is)
 static void toggle_mute(VideoState *is)
 {
     is->muted = !is->muted;
+    submit_is_mute(&is->iipo_warpper,is->muted);
 }
 
 static void update_volume(VideoState *is, int sign, double step)
@@ -1573,6 +1574,193 @@ static void update_volume(VideoState *is, int sign, double step)
     double volume_level = is->audio_volume ? (20 * log(is->audio_volume / (double)SDL_MIX_MAXVOLUME) / log(10)) : -1000.0;
     int new_volume = lrint(SDL_MIX_MAXVOLUME * pow(10.0, (volume_level + sign * step) / 20.0));
     is->audio_volume = av_clip(is->audio_volume == new_volume ? (is->audio_volume + sign) : new_volume, 0, SDL_MIX_MAXVOLUME);
+    submit_audio_volume(&is->iipo_warpper,is->audio_volume);
+}
+
+static void playcall_pause_handler(VideoState *is)
+{
+    toggle_pause(is);
+}
+
+static void playcall_seek_abs_handler(VideoState *is,double seek_abs,enum SeekUnit unit)
+{
+    if(seek_by_bytes||is->ic->duration<=0)
+    {
+        double pos=0;
+        if(unit==sunit_second)
+        {
+            if(is->ic->bit_rate)
+                pos=seek_abs*is->ic->bit_rate/8.0;
+            else
+                pos=seek_abs*180000.0;
+        }
+        else if(unit==sunit_frame)
+        {
+//          每帧大小 ≈ 码率 / 8 / 帧率
+            AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
+            if(is->ic->bit_rate)
+                pos=seek_abs*is->ic->bit_rate/8.0/av_q2d(fr);
+            else
+                pos=seek_abs*180000.0/av_q2d(fr);
+        }
+        else if(unit==sunit_ratio)
+        {
+            uint64_t size=avio_size(is->ic->pb);
+            pos=seek_abs*size;
+        }
+        else
+        {
+            av_log(NULL,AV_LOG_ERROR,"Unknown seek unit value : %u\n",unit);
+        }
+        stream_seek(is,pos,0,1);
+    }
+    else
+    {
+        double pos=0;
+        if(unit==sunit_second)
+        {
+            pos=seek_abs;
+        }
+        else if(unit==sunit_ratio)
+        {
+            pos=seek_abs*is->ic->duration/AV_TIME_BASE;
+        }
+        else if(unit==sunit_frame)
+        {
+            AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
+            pos=seek_abs/av_q2d(fr);
+        }
+        else
+        {
+            av_log(NULL,AV_LOG_ERROR,"Unknown seek unit value : %u\n",unit);
+        }
+        
+        stream_seek(is,(int64_t)(pos*AV_TIME_BASE),0,0);
+    }
+}
+
+static void playcall_seek_rel_handler(VideoState *is,double seek_rel,enum SeekUnit unit)
+{
+    if(seek_by_bytes||is->ic->duration<=0)
+    {
+        double pos=-1;
+        if(pos<0&&is->video_stream>=0)
+            pos=frame_queue_last_pos(&is->pictq);
+        if(pos<0&&is->audio_stream>=0)
+            pos=frame_queue_last_pos(&is->sampq);
+        if(pos<0)
+            pos=avio_tell(is->ic->pb);
+        double incr=0;
+        if(unit==sunit_second)
+        {
+            if(is->ic->bit_rate)
+                incr=seek_rel*is->ic->bit_rate/8.0;
+            else
+                incr=seek_rel*180000.0;
+        }
+        else if(unit==sunit_frame)
+        {
+//          每帧大小 ≈ 码率 / 8 / 帧率
+            AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
+            if(is->ic->bit_rate)
+                incr=seek_rel*is->ic->bit_rate/8.0/av_q2d(fr);
+            else
+                incr=seek_rel*180000.0/av_q2d(fr);
+        }
+        else if(unit==sunit_ratio)
+        {
+            uint64_t size=avio_size(is->ic->pb);
+            incr=seek_rel*size;
+        }
+        else
+        {
+            av_log(NULL,AV_LOG_ERROR,"Unknown seek unit value : %u\n",unit);
+        }
+        pos+=incr;
+        stream_seek(is,pos,incr,1);
+    }
+    else
+    {
+        double pos=get_master_clock(is);
+        if(isnan(pos))
+            pos=(double)is->seek_pos/AV_TIME_BASE;
+        
+        double incr=0;
+        if(unit==sunit_second)
+        {
+            incr=seek_rel;
+        }
+        else if(unit==sunit_ratio)
+        {
+            incr=seek_rel*is->ic->duration/AV_TIME_BASE;
+        }
+        else if(unit==sunit_frame)
+        {
+            AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
+            incr=seek_rel/av_q2d(fr);
+        }
+        else
+        {
+            av_log(NULL,AV_LOG_ERROR,"Unknown seek unit value : %u\n",unit);
+        }
+        
+        pos+=incr;
+        if(is->ic->start_time!=AV_NOPTS_VALUE&&pos<is->ic->start_time/(double)AV_TIME_BASE)
+            pos=is->ic->start_time/(double)AV_TIME_BASE;
+        stream_seek(is,(int64_t)(pos*AV_TIME_BASE),(int64_t)(incr*AV_TIME_BASE),0);
+    }
+}
+
+static void playcall_volume_abs_handler(VideoState *is,double vol_abs)
+{
+    is->audio_volume=iipo_get_volume_sdl_origin(vol_abs);
+    submit_audio_volume(&is->iipo_warpper,is->audio_volume);
+}
+
+static void playcall_volume_rel_handler(VideoState *is,double vol_rel)
+{
+    int ori_ivol=is->audio_volume;
+    double ori_dvol=iipo_get_volume_db_norm(ori_ivol);
+    double new_dvol=av_clipd(ori_dvol+vol_rel,0.0,1.0);
+    int new_ivol=iipo_get_volume_sdl_origin(new_dvol);
+    int sign=(vol_rel>0)?1:(-1);
+    if(new_ivol==ori_ivol)
+        new_ivol+=sign;
+    is->audio_volume=new_ivol;
+    submit_audio_volume(&is->iipo_warpper,is->audio_volume);
+}
+
+static void playcall_mute_handler(VideoState *is,enum MuteState state)
+{
+    if(state==mstate_enable)
+        is->muted=1;
+    else if(state==mstate_disable)
+        is->muted=0;
+    else if(state==mstate_switch)
+        is->muted=!is->muted;
+    else
+    {
+        av_log(NULL,AV_LOG_ERROR,"Unknown mute state value : %u\n",state);
+        return;
+    }
+    submit_is_mute(&is->iipo_warpper,is->muted);
+}
+
+static void playcall_ffplay_handler(void *ctx,PlaycallMultiCommand *cmd)
+{
+    VideoState *is=ctx;
+    if(cmd->inst_flags&pcinst_pause)
+        playcall_pause_handler(is);
+    if(cmd->inst_flags&pcinst_seek_abs)
+        playcall_seek_abs_handler(is,cmd->seekpos_abs,cmd->unit_sa);
+    if(cmd->inst_flags&pcinst_seek_rel)
+        playcall_seek_rel_handler(is,cmd->seekpos_rel,cmd->unit_sr);
+    if(cmd->inst_flags&pcinst_volume_abs)
+        playcall_volume_abs_handler(is,cmd->volume_abs);
+    if(cmd->inst_flags&pcinst_volume_rel)
+        playcall_volume_rel_handler(is,cmd->volume_rel);
+    if(cmd->inst_flags&pcinst_mute)
+        playcall_mute_handler(is,cmd->mute_state);
 }
 
 static void step_to_next_frame(VideoState *is)
@@ -2282,19 +2470,22 @@ static int video_thread(void *arg)
             last_vfilter_idx = is->vfilter_idx;
             frame_rate = av_buffersink_get_frame_rate(filt_out);
         }
-
-		fill_ioplaying(&is->event_warpper,graph,frame);
+        
+		fill_globals(&is->iipo_warpper,graph,frame);
 		
         ret = av_buffersrc_add_frame(filt_in, frame);
         if (ret < 0)
             goto the_end;
-
+        
         while (ret >= 0) {
             FrameData *fd;
 
             is->frame_last_returned_time = av_gettime_relative() / 1000000.0;
 
             ret = av_buffersink_get_frame_flags(filt_out, frame, 0);
+            
+            transfer_playcall(&is->iipo_warpper,graph);
+            
             if (ret < 0) {
                 if (ret == AVERROR_EOF)
                     is->viddec.finished = is->viddec.pkt_serial;
@@ -3294,7 +3485,9 @@ static VideoState *stream_open(const char *filename,
     is->av_sync_type = av_sync_type;
     is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
 	
-	event_warpper_init(&is->event_warpper);
+	event_warpper_init(&is->iipo_warpper);
+    submit_audio_volume(&is->iipo_warpper,is->audio_volume);
+    submit_is_mute(&is->iipo_warpper,is->muted);
     
     if (!is->read_tid) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
@@ -3455,7 +3648,7 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
-		submit_event(&cur_stream->event_warpper,event);
+		submit_event(&cur_stream->iipo_warpper,event);
         switch (event.type) {
         case SDL_KEYDOWN:
             if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
@@ -3629,7 +3822,7 @@ static void event_loop(VideoState *cur_stream)
                         SDL_DestroyTexture(cur_stream->vis_texture);
                         cur_stream->vis_texture = NULL;
                     }
-                    submit_size_event(&cur_stream->event_warpper,screen_width,screen_height);
+                    submit_size_event(&cur_stream->iipo_warpper,screen_width,screen_height);
                     if (vk_renderer)
                         vk_renderer_resize(vk_renderer, screen_width, screen_height);
                 case SDL_WINDOWEVENT_EXPOSED:
@@ -3643,6 +3836,7 @@ static void event_loop(VideoState *cur_stream)
         default:
             break;
         }
+        call_playcall_handler(playcall_ffplay_handler,&cur_stream->iipo_warpper,cur_stream);
     }
 }
 

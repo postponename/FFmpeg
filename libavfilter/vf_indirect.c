@@ -25,6 +25,7 @@ static av_cold int init(AVFilterContext *ctx)
 {
 	IndirectContext *indctx = ctx->priv;
     memset(&indctx->ioplaying_global,0,sizeof(IOPlayingGlobal));
+    memset(&indctx->playcall_global,0,sizeof(PlaycallGlobal));
     av_bprint_init(&indctx->expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
     av_bprint_init(&indctx->vf_desc_expand,0,AV_BPRINT_SIZE_UNLIMITED);
     
@@ -202,6 +203,7 @@ static double do_eval_expr(indirect_expansion_context *ctx,const char* ori_expr)
         av_log(ctx->ind, AV_LOG_ERROR,
                "Text expansion expression '%s' is not valid %d\n",
                expr,__LINE__);
+        return NAN;
     }
     
     double value=av_expr_eval(expr_tree,ctx->var_values,ctx);
@@ -210,7 +212,10 @@ static double do_eval_expr(indirect_expansion_context *ctx,const char* ori_expr)
 
 static int eval_condition(indirect_expansion_context *eval_ctx)
 {    
-    return do_eval_expr(eval_ctx,eval_ctx->ind->cond_expr);
+    double ret=do_eval_expr(eval_ctx,eval_ctx->ind->cond_expr);
+    if(isnan(ret))
+        return 0;
+    return ret!=0;
 }
 
 typedef struct
@@ -263,6 +268,7 @@ static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **a
     const char *key_temp=argv[0];
     char *metakey=av_get_token(&key_temp,"");
     ff_expand_func_metadata(ctx->ind,ctx->frm,metakey,bp,name,argv,argc);
+    av_freep(&metakey);
 }
 static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
@@ -293,6 +299,8 @@ static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,in
     const char *expr_temp=argv[0];
     char *expr=av_get_token(&expr_temp,"");
     double value=do_eval_expr(ctx,expr);
+    if(isnan(value))
+        value=0;
     av_freep(&expr);
     ff_expand_func_if(ctx->ind,value,bp,name,argv,argc);
 }
@@ -420,6 +428,7 @@ end:
 }
 static const char *expand_video_filter_desc(indirect_expansion_context *ctx,const char* ori_vf)
 {
+    av_assert0(ori_vf);
     AVBPrint *bp=&ctx->ind->vf_desc_expand;
     av_bprint_clear(bp);
     
@@ -444,13 +453,13 @@ static const char *expand_video_filter_desc(indirect_expansion_context *ctx,cons
     return bp->str;
 }
 
-static int ioplaying_check(IndirectContext *ind)
+static int indirect_ioplaying_check(IndirectContext *ind)
 {
     return ind->ioplaying_global.window_w!=0;
 }
-static void fill_ioplaying(IndirectContext *ind,AVFilterGraph *graph)
+static void indirect_fill_globals(IndirectContext *ind,AVFilterGraph *graph)
 {
-    if(!ioplaying_check(ind))
+    if(!indirect_ioplaying_check(ind))
         return;
     for(int i=0;i<graph->nb_filters;i++)
     {
@@ -464,9 +473,26 @@ static void fill_ioplaying(IndirectContext *ind,AVFilterGraph *graph)
         {
             IndirectContext *indctx=fi->priv;
             indctx->ioplaying_global=ind->ioplaying_global;
+            indctx->playcall_global=ind->playcall_global;
+        }
+        if(strcmp(fi->filter->name,"playcall")==0)
+        {
+            PlaycallContext *pcctx=fi->priv;
+            pcctx->global=ind->playcall_global;
         }
     }
 }
+static void indirect_transfer_playcall(IndirectContext *ind,AVFilterGraph *graph)
+{
+    PlaycallGlobal *pcg=&ind->playcall_global;
+    if(!pcg->playcall_transferer||!pcg->opaque)
+    {
+        av_log(ind,AV_LOG_WARNING,"invalid playcall_transferer funcptr and opaque ptr for indirect");
+        return;
+    }
+    pcg->playcall_transferer(pcg->opaque,graph);
+}
+
 static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectContext *ind,const char *vfilter)
 {
     int ret=0;
@@ -510,6 +536,7 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     par->alpha_mode          = frame->alpha_mode;
     par->frame_rate          = inl->frame_rate;
     par->hw_frames_ctx       = frame->hw_frames_ctx;
+    
     ret=av_buffersrc_parameters_set(filt_src,par);
     if(ret<0)
         goto fail;
@@ -565,7 +592,7 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     if(ret<0)
         goto fail;
     
-    fill_ioplaying(ind,graph);
+    indirect_fill_globals(ind,graph);
     
     ret=av_buffersrc_add_frame(filt_src,frame);
     if(ret<0)
@@ -574,6 +601,8 @@ static int execute_video_filter(AVFilterLink *inlink, AVFrame *frame,IndirectCon
     ret=av_buffersink_get_frame_flags(filt_out,frame,0);
     if(ret<0)
         goto fail;
+
+    indirect_transfer_playcall(ind,graph);
     
     ret=ff_filter_frame(inlink->dst->outputs[0],frame);
     
@@ -589,7 +618,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
 	AVFilterContext *ctx = inlink->dst;
 	IndirectContext *indctx=ctx->priv;
-    if(indctx->wait_ioplaying&&!ioplaying_check(indctx))
+    if(indctx->wait_ioplaying&&!indirect_ioplaying_check(indctx))
     {
         av_log(indctx,AV_LOG_DEBUG,"context not initialized,do nothing\n");
         return ff_filter_frame(ctx->outputs[0], frame);
@@ -606,7 +635,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     int ret=0;
     if(indctx->vf_desc&&eval_condition(&expd_ctx))
     {
-        av_log(indctx,AV_LOG_INFO,"indirect triggered cond=%s, vf=%s\n",indctx->cond_expr,indctx->vf_desc);
         const char *vfilter=expand_video_filter_desc(&expd_ctx,indctx->vf_desc);        
         ret=execute_video_filter(inlink,frame,indctx,vfilter);
     }

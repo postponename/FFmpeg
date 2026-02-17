@@ -292,8 +292,14 @@ static int eval_condition(IOPlayingContext *log_ctx,const char *cond,IOPlayingGl
         {
             av_log(log_ctx, AV_LOG_WARNING, 
                    "too much arguments (more than 16) : '%s'\n",ori_cond);
+            av_log(log_ctx,AV_LOG_INFO,"[");
+            for(int i=0;i<argc;i++)
+                av_log(log_ctx,AV_LOG_INFO,"'%s',",argv[i]);
+            av_log(log_ctx,AV_LOG_INFO,"]\n");
             av_freep(&argv[--argc]);
         }
+        if(!*cond)
+            break;
         cond++;
     }
     res=eval_condition_args(log_ctx,gbl,argv[0],argv+1,argc-1);
@@ -354,6 +360,8 @@ static const char *const out_value_expr_var_names[]=
     "mods_shift",
     "mods_alt",
     "once",
+    "audio_volume",
+    "is_mute",
     
     /*var_dict elements will be added dynamically*/
     /*key(KeyName) will be evaluated as unary function calls*/
@@ -381,6 +389,8 @@ enum out_value_expr_var_index
     VAR_MODS_SHIFT,
     VAR_MODS_ALT,
     VAR_ONCE,
+    VAR_AUDIO_VOLUME,
+    VAR_IS_MUTE,
     VAR_NUMBER,
 };
 
@@ -435,6 +445,8 @@ static void fill_event_vars(double *vars,IOPlayingGlobal *gbl)
     vars[VAR_MODS_SHIFT]      = gbl->keyboard.mod_shift;
     vars[VAR_MODS_ALT]        = gbl->keyboard.mod_alt;
     vars[VAR_ONCE]            = gbl->once;
+    vars[VAR_AUDIO_VOLUME]    = gbl->audio_volume;
+    vars[VAR_IS_MUTE]         = gbl->is_mute;
 }
 
 static double key_func_warp(void *c0,double keycode)
@@ -490,6 +502,7 @@ static void fill_expansion_context(output_value_expr_expansion_context *ctx)
     for(const AVDictionaryEntry *e=av_dict_iterate(var_dict,NULL);e;e=av_dict_iterate(var_dict,e),i++)
     {
         av_assert0(i<nb_var);
+        
         var_names[i]=av_strdup(e->key);
         var_vals[i]=strtod_silent(e->value);
     }
@@ -581,6 +594,7 @@ static double do_eval_expr(output_value_expr_expansion_context *ctx,const char *
         av_log(ctx->io, AV_LOG_ERROR,
                "Text expansion expression '%s' is not valid %d\n",
                expr,__LINE__);
+        return NAN;
     }
     
     double value=av_expr_eval(expr_tree,ctx->var_values,ctx);
@@ -629,6 +643,8 @@ static void out_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int a
 {
     output_value_expr_expansion_context *ctx=c0;
     double value=do_eval_expr(ctx,argv[0]);
+    if(isnan(value))
+        value=0;
     ff_expand_func_if(ctx->io,value,bp,name,argv,argc);
 }
 

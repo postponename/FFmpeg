@@ -27,11 +27,68 @@ typedef struct
 typedef struct
 {
     int window_w,window_h;
+    double audio_volume;
+    int is_mute;
     int once;
+    
     MouseStatus mouse;
     KeyboardStatus keyboard;
     AVDictionary **var_dict;
 }IOPlayingGlobal;
+
+enum PlaycallInst : unsigned
+{
+    pcinst_nop           = 0b00000000,
+    pcinst_pause         = 0b00000001,
+    pcinst_seek_abs      = 0b00000010,
+    pcinst_seek_rel      = 0b00000100, 
+    pcinst_volume_abs    = 0b00001000,
+    pcinst_volume_rel    = 0b00010000,
+    pcinst_mute          = 0b00100000,
+};
+enum SeekUnit : unsigned
+{                                                                                                                                                                                                                                 
+    sunit_second         = 1,
+    sunit_frame          = 2,
+    sunit_ratio          = 3,
+};
+enum MuteState : unsigned
+{                                                                                                                                                                                                                                 
+    mstate_enable        = 1,
+    mstate_disable       = 2,
+    mstate_switch        = 3,
+};
+typedef struct PlaycallCommand
+{
+    enum PlaycallInst inst;
+    union
+    {
+        struct
+        {
+            double value;
+            enum SeekUnit unit;
+        }seekpos_abs;
+        struct
+        {
+            double value;
+            enum SeekUnit unit;
+        }seekpos_rel;
+        double volume_abs;
+        double volume_rel;
+        enum MuteState mute_st;
+    };
+}PlaycallCommand;
+
+typedef struct PlaycallGlobal
+{
+    int window_w,window_h;
+    double audio_volume;
+    int is_mute;
+    
+    void *opaque;
+    void (*playcall_transferer)(void *ctx,AVFilterGraph *graph);
+    
+}PlaycallGlobal;
 
 typedef struct IOPlayingContext
 {
@@ -59,22 +116,21 @@ typedef struct IndirectContext
     AVBPrint vf_desc_expand;
     
     IOPlayingGlobal ioplaying_global;
+    PlaycallGlobal playcall_global;
+    
 }IndirectContext;
-
-typedef struct PlaycallGlobal
-{
-    int window_w,window_h;
-}PlaycallGlobal;
 
 typedef struct PlaycallContext
 {
     const AVClass *class;
 
-    char *cond_expr,*call_expr;
+    char *call_expr;
     int start_number;
     int req_ioplaying;
-    
+
+    AVBPrint expr_prep;
     
     PlaycallGlobal global;
+    PlaycallCommand cmd;
 }PlaycallContext;
 #endif
