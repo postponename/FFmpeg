@@ -1345,7 +1345,7 @@ static void stream_close(VideoState *is)
     if (is->sub_texture)
         SDL_DestroyTexture(is->sub_texture);
     
-    event_warpper_uninit(&is->iipo_warpper);
+    iipo_warpper_uninit(&is->iipo_warpper);
     av_free(is);
 }
 
@@ -1596,7 +1596,6 @@ static void playcall_seek_abs_handler(VideoState *is,double seek_abs,enum SeekUn
         }
         else if(unit==sunit_frame)
         {
-//          每帧大小 ≈ 码率 / 8 / 帧率
             AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
             if(is->ic->bit_rate)
                 pos=seek_abs*is->ic->bit_rate/8.0/av_q2d(fr);
@@ -1660,7 +1659,6 @@ static void playcall_seek_rel_handler(VideoState *is,double seek_rel,enum SeekUn
         }
         else if(unit==sunit_frame)
         {
-//          每帧大小 ≈ 码率 / 8 / 帧率
             AVRational fr=av_guess_frame_rate(is->ic, is->video_st, NULL);
             if(is->ic->bit_rate)
                 incr=seek_rel*is->ic->bit_rate/8.0/av_q2d(fr);
@@ -1719,6 +1717,8 @@ static void playcall_volume_abs_handler(VideoState *is,double vol_abs)
 
 static void playcall_volume_rel_handler(VideoState *is,double vol_rel)
 {
+    if(vol_rel==0)
+        return;
     int ori_ivol=is->audio_volume;
     double ori_dvol=iipo_get_volume_db_norm(ori_ivol);
     double new_dvol=av_clipd(ori_dvol+vol_rel,0.0,1.0);
@@ -3485,7 +3485,7 @@ static VideoState *stream_open(const char *filename,
     is->av_sync_type = av_sync_type;
     is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
 	
-	event_warpper_init(&is->iipo_warpper);
+	iipo_warpper_init(&is->iipo_warpper);
     submit_audio_volume(&is->iipo_warpper,is->audio_volume);
     submit_is_mute(&is->iipo_warpper,is->muted);
     

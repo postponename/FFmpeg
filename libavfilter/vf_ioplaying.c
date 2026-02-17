@@ -292,10 +292,7 @@ static int eval_condition(IOPlayingContext *log_ctx,const char *cond,IOPlayingGl
         {
             av_log(log_ctx, AV_LOG_WARNING, 
                    "too much arguments (more than 16) : '%s'\n",ori_cond);
-            av_log(log_ctx,AV_LOG_INFO,"[");
-            for(int i=0;i<argc;i++)
-                av_log(log_ctx,AV_LOG_INFO,"'%s',",argv[i]);
-            av_log(log_ctx,AV_LOG_INFO,"]\n");
+
             av_freep(&argv[--argc]);
         }
         if(!*cond)

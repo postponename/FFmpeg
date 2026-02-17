@@ -36,7 +36,7 @@ typedef struct IIPOWarpper
 double iipo_get_volume_db_norm(int ivol);
 int iipo_get_volume_sdl_origin(double dvol);
 
-void event_warpper_init(IIPOWarpper *warp);
+void iipo_warpper_init(IIPOWarpper *warp);
 void submit_event(IIPOWarpper* warp,SDL_Event eve);
 void submit_size_event(IIPOWarpper* warp,int w,int h);
 void submit_audio_volume(IIPOWarpper *warp,int volume);
@@ -44,6 +44,6 @@ void submit_is_mute(IIPOWarpper *warp,int is_mute);
 void fill_globals(IIPOWarpper* warp,AVFilterGraph *graph,AVFrame *frm);
 void transfer_playcall(IIPOWarpper* warp,AVFilterGraph *graph);
 void call_playcall_handler(void (*playcall_handler)(void *ctx,PlaycallMultiCommand *cmd),IIPOWarpper *warp,void *ctx);
-void event_warpper_uninit(IIPOWarpper *warp);
+void iipo_warpper_uninit(IIPOWarpper *warp);
 
 #endif

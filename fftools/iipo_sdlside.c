@@ -33,7 +33,7 @@ static void transfer_playcall_warp(void *ctx,AVFilterGraph *graph)
     transfer_playcall(ctx,graph);
 }
 
-void event_warpper_init(IIPOWarpper *warp)
+void iipo_warpper_init(IIPOWarpper *warp)
 {
     av_log(NULL, AV_LOG_INFO,"event_warpper_init=warp=%p\n",(void*)warp);
     memset(warp,0,sizeof(IIPOWarpper));
@@ -53,7 +53,7 @@ void event_warpper_init(IIPOWarpper *warp)
     warp->playcall.playcall_transferer=transfer_playcall_warp;
 }
 
-void event_warpper_uninit(IIPOWarpper *warp)
+void iipo_warpper_uninit(IIPOWarpper *warp)
 {
     av_log(NULL, AV_LOG_DEBUG,"event_warpper_uninit=warp=%p\n",(void*)warp);
     ff_hashtable_freep(&warp->key_status.map),warp->key_status.map=NULL;
