@@ -7,3 +7,8 @@ cp /c/msys64/mingw64/bin/libva.dll ./build/bin/
 cp /c/msys64/mingw64/bin/libx264-165.dll ./build/bin/
 cp /c/msys64/mingw64/bin/libharfbuzz-0.dll ./build/bin/
 cp /c/msys64/mingw64/bin/libx265-215.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libfontconfig-1.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libfreetype-6.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libglib-2.0-0.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libpng16-16.dll ./build/bin/
+cp /c/msys64/mingw64/bin/libgraphite2.dll ./build/bin/

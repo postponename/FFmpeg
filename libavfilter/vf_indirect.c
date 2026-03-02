@@ -21,21 +21,230 @@
 #include <math.h>
 #include <fenv.h>
 
+#ifdef _WIN32
+#include <compat/w32dlfcn.h>
+#else
+#include <dlfcn.h>
+#endif
+
+typedef struct
+{
+    const AVClass *class;
+    AVBPrint item_name;
+}IndirectInvokeeLogCtx;
+
+static const char *indirect_invokee_item_name(void *ptr)
+{
+    IndirectInvokeeLogCtx *ctx=ptr;
+    return ctx->item_name.str;
+}
+
+const AVClass indirect_invokee_class=
+{
+    .class_name = "IndirectInvokee",
+    .item_name  = indirect_invokee_item_name,
+    .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_FILTER,
+};
+
+static void *init_invoke_log_ctx(const char *path)
+{
+    IndirectInvokeeLogCtx *ctx=(IndirectInvokeeLogCtx*)av_mallocz(sizeof(IndirectInvokeeLogCtx));
+    ctx->class=&indirect_invokee_class;
+    av_bprint_init(&ctx->item_name,0,AV_BPRINT_SIZE_UNLIMITED);
+    av_bprintf(&ctx->item_name,"%s / %s",ctx->class->class_name,path);
+    return ctx;
+}
+
+static void uninit_invoke_log_ctx(void **ptr_ctx)
+{
+    IndirectInvokeeLogCtx *ctx=*ptr_ctx;
+    
+    av_bprint_finalize(&ctx->item_name,NULL);
+    av_free(ctx);
+    *ptr_ctx=NULL;
+}
+
+static IndirectInvokeContext *invoke_load(const char *path,char *stapar,int provide_log)
+{
+    IndirectInvokeContext *ctx=(IndirectInvokeContext*)av_mallocz(sizeof(IndirectInvokeContext));
+    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
+    ctx->path=path;
+    ctx->lib=dlopen(path,0);
+    if(!ctx->lib)
+    {
+        av_log(NULL,AV_LOG_ERROR,"failed to load dynamic library '%s'\n",path);
+        goto fail;
+    }
+    av_log(NULL,AV_LOG_INFO,"ctx->lib:%p\n",ctx->lib);
+    ctx->init=(InvokeInitFunc)dlsym(ctx->lib,"indirect_invoke_init");
+    if(!ctx->init)
+    {
+        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_init' from '%s'\n",path);
+        goto fail;
+    }
+    av_log(NULL,AV_LOG_INFO,"ctx->init:%p\n",(void*)ctx->init);
+    ctx->vf=(InvokeVFFunc)dlsym(ctx->lib,"indirect_invoke_vf");
+    if(!ctx->vf)
+    {
+        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_vf' from '%s'\n",path);
+        goto fail;
+    }
+    av_log(NULL,AV_LOG_INFO,"ctx->vf:%p\n",(void*)ctx->vf);
+    ctx->uninit=(InvokeUninitFunc)dlsym(ctx->lib,"indirect_invoke_uninit");
+    if(!ctx->uninit)
+    {
+        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_uninit' from '%s'\n",path);
+        goto fail;
+    }
+    av_log(NULL,AV_LOG_INFO,"ctx->uninit:%p\n",(void*)ctx->uninit);
+    
+    if(provide_log)
+        ctx->log_ctx=init_invoke_log_ctx(path);
+    else
+        ctx->log_ctx=NULL;
+    
+    ctx->opaque=ctx->init(stapar,ctx->log_ctx);
+    if(!ctx->opaque)
+    {
+        av_log(NULL,AV_LOG_ERROR,"failed to initialize dynamic library '%s'\n",path);
+        goto fail;
+    }
+    av_log(NULL,AV_LOG_INFO,"ctx->opaque:%p,&ctx->opaque:%p\n",ctx->opaque,&ctx->opaque);
+    return ctx;
+fail:
+    if(!ctx)
+        return NULL;
+    if(ctx->log_ctx)
+        uninit_invoke_log_ctx(&ctx->log_ctx);
+    if(ctx->lib)
+        dlclose(ctx->lib),
+        ctx->lib=NULL;
+    av_freep(&ctx);
+    return NULL;
+}
+static const char *invoke_vf(IndirectInvokeContext *ctx,int argc,char **argv)
+{
+    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
+    if(!ctx||!ctx->lib||!ctx->opaque||!ctx->vf)
+        return NULL;
+    int status=0;
+    const char *vf=ctx->vf(ctx->opaque,argc,argv,&status);
+    av_log(NULL,AV_LOG_INFO,"vf:%s\n",vf);
+    av_log(NULL,AV_LOG_INFO,"status:%d\n",status);
+    if(!status)
+    {
+        av_log(NULL,AV_LOG_ERROR,"dynamic library '%s' failed to gnerate video filter desc\n",ctx->path);
+        return NULL;
+    }
+    return vf;
+}
+static void invoke_unload(IndirectInvokeContext **ctx_ptr)
+{
+    IndirectInvokeContext *ctx=*ctx_ptr;
+    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
+    if(!ctx||!ctx->lib||!ctx->opaque||!ctx->uninit)
+        return;
+    ctx->uninit(&ctx->opaque);
+    av_log(NULL,AV_LOG_INFO,"ctx->opaque:%p,&ctx->opaque:%p\n",ctx->opaque,&ctx->opaque);
+    dlclose(ctx->lib);
+    ctx->lib=NULL;
+    if(ctx->log_ctx)
+        uninit_invoke_log_ctx(&ctx->log_ctx);
+    av_free(ctx);
+    *ctx_ptr=NULL;
+}
+
+
+#define WHITESPACES " \n\t\r"
+
+//the no-content-modifing version of av_get_token[avstring.c:143],and reserves  all '
+static char *get_token_plain(const char **buf, const char *term)
+{
+    char *out     = av_realloc(NULL, strlen(*buf) + 1);
+    char *ret     = out, *end = out;
+    const char *p = *buf;
+    if (!out)
+        return NULL;
+    p += strspn(p, WHITESPACES);
+    
+    while (*p && !strspn(p, term))
+    {
+        char c = *p++;
+        if (c=='\\'&&*p)
+        {
+            *out++ = '\\';
+            *out++ = *p++;
+        }
+        else if (c == '\'')
+        {
+            *out++ = '\'';
+            while (*p && *p != '\'')
+                *out++ = *p++;
+            if (*p)
+            {
+                *out++ = '\'';
+                p++;
+                end = out;
+            }
+        } else {
+            *out++ = c;
+        }
+    }
+    
+    do
+        *out-- = 0;
+    while (out >= end && strspn(out, WHITESPACES));
+    
+    *buf = p;
+    
+    char *small_ret = av_realloc(ret, out - ret + 2);
+    return small_ret ? small_ret : ret;
+}
+
+
+
+
+
+
+
 static av_cold int init(AVFilterContext *ctx)
 {
 	IndirectContext *indctx = ctx->priv;
     memset(&indctx->ioplaying_global,0,sizeof(IOPlayingGlobal));
     memset(&indctx->playcall_global,0,sizeof(PlaycallGlobal));
     av_bprint_init(&indctx->expr_prep,0,AV_BPRINT_SIZE_UNLIMITED);
-    av_bprint_init(&indctx->vf_desc_expand,0,AV_BPRINT_SIZE_UNLIMITED);
-    
+    av_bprint_init(&indctx->desc_cmd_expand,0,AV_BPRINT_SIZE_UNLIMITED);
+    if(indctx->vf_desc&&indctx->invoke_cmd)
+    {
+        av_log(indctx,AV_LOG_ERROR,"cannot indicate both 'vf' and 'invoke'\n");
+    }
+    if(indctx->invoke_cmd)
+    {
+        av_assert0(!indctx->vf_desc);
+        const char *temp_cmd=indctx->invoke_cmd;
+        indctx->invoke_path=av_get_token(&temp_cmd,":");
+        temp_cmd++;//skip colomn
+        if(!temp_cmd)
+            indctx->invoke_param=NULL;
+        else
+            indctx->invoke_param=get_token_plain(&temp_cmd,"");
+        av_log(indctx,AV_LOG_INFO,"%s0 %s\n",indctx->invoke_path,indctx->invoke_param);
+        indctx->invoke_ctx=invoke_load(indctx->invoke_path,indctx->invoke_stapar,indctx->invoke_provide_log);
+    }
 	return 0;
 }
 static av_cold void uninit(AVFilterContext *ctx)
 {
     IndirectContext *indctx = ctx->priv;
     av_bprint_finalize(&indctx->expr_prep,NULL);
-    av_bprint_finalize(&indctx->vf_desc_expand,NULL);
+    av_bprint_finalize(&indctx->desc_cmd_expand,NULL);
+    if(indctx->invoke_cmd)
+    {
+        av_freep(&indctx->invoke_path);
+        av_freep(&indctx->invoke_param);
+        invoke_unload(&indctx->invoke_ctx);
+    }
 }
 
 
@@ -222,47 +431,47 @@ typedef struct
 {
     const char *name;
     void (*expand)(void *ctx,AVBPrint *bp,const char *name,char **argv,int argc);
-}vf_desc_expansion_func_entry;
-static void vfdesc_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static vf_desc_expansion_func_entry vfdesc_func_table[]=
+}indirect_expansion_func_entry;
+static void expa_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static void expa_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
+static indirect_expansion_func_entry vfdesc_func_table[]=
 {
-    {"pict_type",          vfdesc_func_pict_type          },
-    {"pts",                vfdesc_func_pts                },
-    {"frame_num",          vfdesc_func_frame_num          },
-    {"n",                  vfdesc_func_frame_num          },
-    {"metadata",           vfdesc_func_metadata           },
-    {"gmtime",             vfdesc_func_strftime           },
-    {"localtime",          vfdesc_func_strftime           },
-    {"expr",               vfdesc_func_eval_expr          },
-    {"e",                  vfdesc_func_eval_expr          },
-    {"expr_int_format",    vfdesc_func_eval_expr_int_fmt  },
-    {"eif",                vfdesc_func_eval_expr_int_fmt  },
-    {"if",                 vfdesc_func_if                 },
+    {"pict_type",          expa_func_pict_type          },
+    {"pts",                expa_func_pts                },
+    {"frame_num",          expa_func_frame_num          },
+    {"n",                  expa_func_frame_num          },
+    {"metadata",           expa_func_metadata           },
+    {"gmtime",             expa_func_strftime           },
+    {"localtime",          expa_func_strftime           },
+    {"expr",               expa_func_eval_expr          },
+    {"e",                  expa_func_eval_expr          },
+    {"expr_int_format",    expa_func_eval_expr_int_fmt  },
+    {"eif",                expa_func_eval_expr_int_fmt  },
+    {"if",                 expa_func_if                 },
 };
 
-static void vfdesc_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_pict_type(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     ff_expand_func_pict_type(ctx->ind,ctx->frm,bp,name,argv,argc);
 }
-static void vfdesc_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_pts(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     ff_expand_func_pts(ctx->ind,ctx->pts,bp,name,argv,argc);
 }
-static void vfdesc_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_frame_num(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     ff_expand_func_frame_num(ctx->ind,ctx->frame_number,bp,name,argv,argc);
 }
-static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_metadata(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     const char *key_temp=argv[0];
@@ -270,12 +479,12 @@ static void vfdesc_func_metadata(void *c0,AVBPrint *bp,const char *name,char **a
     ff_expand_func_metadata(ctx->ind,ctx->frm,metakey,bp,name,argv,argc);
     av_freep(&metakey);
 }
-static void vfdesc_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_strftime(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     ff_expand_func_strftime(ctx->ind,bp,name,argv,argc);
 }
-static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     const char *expr_temp=argv[0];
@@ -284,7 +493,7 @@ static void vfdesc_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **
     av_freep(&expr);
     ff_expand_func_eval_expr(ctx->ind,value,bp,name,argv,argc);
 }
-static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     const char *expr_temp=argv[0];
@@ -293,7 +502,7 @@ static void vfdesc_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name
     av_freep(&expr);
     ff_expand_func_eval_expr_int_fmt(ctx->ind,value,bp,name,argv,argc);
 }
-static void vfdesc_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
+static void expa_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc)
 {
     indirect_expansion_context *ctx=c0;
     const char *expr_temp=argv[0];
@@ -329,119 +538,74 @@ static void do_expand_function(indirect_expansion_context *ctx,AVBPrint *bp,char
 }
 
 
-#define WHITESPACES " \n\t\r"
-
-//the no-content-modifing version of av_get_token[avstring.c:143],and reserves  all '
-static char *get_token_plain(const char **buf, const char *term)
+static void expand_function(indirect_expansion_context *ctx,AVBPrint *bp,const char **pstr)
 {
-    char *out     = av_realloc(NULL, strlen(*buf) + 1);
-    char *ret     = out, *end = out;
-    const char *p = *buf;
-    if (!out)
-        return NULL;
-    p += strspn(p, WHITESPACES);
-    
-    while (*p && !strspn(p, term))
-    {
-        char c = *p++;
-        if (c=='\\'&&*p)
-        {
-            *out++ = '\\';
-            *out++ = *p++;
-        }
-        else if (c == '\'')
-        {
-            *out++ = '\'';
-            while (*p && *p != '\'')
-                *out++ = *p++;
-            if (*p)
-            {
-                *out++ = '\'';
-                p++;
-                end = out;
-            }
-        } else {
-            *out++ = c;
-        }
-    }
-    
-    do
-        *out-- = 0;
-    while (out >= end && strspn(out, WHITESPACES));
-    
-    *buf = p;
-    
-    char *small_ret = av_realloc(ret, out - ret + 2);
-    return small_ret ? small_ret : ret;
-}
-static void expand_vf_desc_function(indirect_expansion_context *ctx,AVBPrint *bp,const char **pdesc)
-{
-    const char *desc=*pdesc;
-    av_assert0(*desc=='$');
+    const char *str=*pstr;
+    av_assert0(*str=='$');
     
     int dcnt=0;
-    while(*desc=='$')
-        dcnt++,++desc;
+    while(*str=='$')
+        dcnt++,++str;
     if(dcnt>1)
     {
         av_bprint_chars(bp,'$',dcnt-1);
-        *pdesc=desc;
+        *pstr=str;
         return;
     }
-    av_assert0(dcnt==1&&*desc!='$');
+    av_assert0(dcnt==1&&*str!='$');
     
-    if(*desc!='(')
+    if(*str!='(')
     {
         av_bprint_chars(bp,'$',1);
-        *pdesc=desc;
+        *pstr=str;
         return;
     }
-    desc++;
+    str++;
     
     char *argv[16];
     int argc=0;
     while(1)
     {
-        if(!(argv[argc++]=get_token_plain(&desc, "|)")))
+        if(!(argv[argc++]=get_token_plain(&str, "|)")))
         {
             av_log(ctx->ind,AV_LOG_ERROR,"av_get_token failed because of onmem\n");
             goto end;
         }
-        if (!*desc)
+        if (!*str)
         {
-            av_log(ctx->ind,AV_LOG_ERROR,"Unterminated $...$() near '%s'\n", *pdesc);
+            av_log(ctx->ind,AV_LOG_ERROR,"Unterminated $...$() near '%s'\n", *pstr);
             goto end;
         }
         if(argc==FF_ARRAY_ELEMS(argv))
             av_freep(&argv[--argc]);
-        if(*desc==')')
+        if(*str==')')
             break;
-        desc++;
+        str++;
     }
     
-    *pdesc=desc+1;
+    *pstr=str+1;
     do_expand_function(ctx,bp,argv[0],argv+1,argc-1);
     
 end:
     for(int i=0;i<argc;i++)
         av_freep(&argv[i]);
 }
-static const char *expand_video_filter_desc(indirect_expansion_context *ctx,const char* ori_vf)
+static const char *expand_dynstr(indirect_expansion_context *ctx,const char* ori)
 {
-    av_assert0(ori_vf);
-    AVBPrint *bp=&ctx->ind->vf_desc_expand;
+    av_assert0(ori);
+    AVBPrint *bp=&ctx->ind->desc_cmd_expand;
     av_bprint_clear(bp);
     
-    while(*ori_vf)
+    while(*ori)
     {
-        if(*ori_vf=='$')
+        if(*ori=='$')
         {
-            expand_vf_desc_function(ctx,bp,&ori_vf);
+            expand_function(ctx,bp,&ori);
         }
         else
         {
-           av_bprint_chars(bp,*ori_vf,1);
-           ori_vf++;
+           av_bprint_chars(bp,*ori,1);
+           ori++;
         }
     }
     if(!av_bprint_is_complete(bp))
@@ -451,6 +615,41 @@ static const char *expand_video_filter_desc(indirect_expansion_context *ctx,cons
     
     
     return bp->str;
+}
+
+static const char *call_invoke_vf(indirect_expansion_context *ctx,IndirectInvokeContext *ivk,const char *param)
+{
+    if(!param)
+    {
+        return invoke_vf(ivk,0,NULL);
+    }
+    
+    const char *result=NULL;
+    const char *expd=expand_dynstr(ctx,param);
+    
+    char *argv[16];
+    int argc=0;
+    while(1)
+    {
+        if(!(argv[argc++]=get_token_plain(&expd, ":")))
+        {
+            av_log(ctx->ind,AV_LOG_ERROR,"av_get_token failed because of onmem\n");
+            goto end;
+        }
+        if(argc==FF_ARRAY_ELEMS(argv))
+            av_freep(&argv[--argc]);
+        if(!*expd)
+            break;
+        expd++;
+    }
+    
+    result=invoke_vf(ivk,argc,argv);
+    
+end:
+    for(int i=0;i<argc;i++)
+        av_freep(&argv[i]);
+    
+    return result;
 }
 
 static int indirect_ioplaying_check(IndirectContext *ind)
@@ -632,18 +831,27 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         .frm=frame
     };
     fill_eval_context(&expd_ctx);
-    int ret=0;
-    if(indctx->vf_desc&&eval_condition(&expd_ctx))
+    int cond=eval_condition(&expd_ctx);
+    if(!cond || (indctx->vf_desc&&indctx->invoke_cmd) )
     {
-        const char *vfilter=expand_video_filter_desc(&expd_ctx,indctx->vf_desc);        
-        ret=execute_video_filter(inlink,frame,indctx,vfilter);
+        return ff_filter_frame(ctx->outputs[0], frame);
     }
-    else
+    
+    if(indctx->vf_desc)
     {
-        ret=ff_filter_frame(ctx->outputs[0],frame);
+        const char *vfilter=expand_dynstr(&expd_ctx,indctx->vf_desc);        
+        return execute_video_filter(inlink,frame,indctx,vfilter);
+    }
+    if(indctx->invoke_cmd)
+    {
+        const char *vfilter=call_invoke_vf(&expd_ctx,indctx->invoke_ctx,indctx->invoke_param);
+        if(!vfilter)
+            return ff_filter_frame(ctx->outputs[0], frame);
+        av_log(indctx,AV_LOG_INFO,"get video filter from dynamic library : '%s'",vfilter);
+        return execute_video_filter(inlink,frame,indctx,vfilter);
     }
     free_eval_context(&expd_ctx);
-    return ret;
+    return 0;
 }
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args, char *res, int res_len, int flags)
@@ -657,10 +865,15 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
 
 static const AVOption indirect_options[]=
 {
-	{ "cond",            "condition to toggle the indirect execution",                                                       OFFSET(cond_expr),         AV_OPT_TYPE_STRING, { .str="0"     },       0, 0,       FLAGS },
-	{ "vf",              "set video filters",                                                                                OFFSET(vf_desc),           AV_OPT_TYPE_STRING, { .str=NULL    },       0, 0,       FLAGS },
-    { "start_number",    "start frame number for n/frame_num variable",                                                      OFFSET(start_number),      AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS },
-	{ "wait_ioplaying",  "weather the execution of video filters depends on the readility of the context for ioplaying ",    OFFSET(wait_ioplaying),    AV_OPT_TYPE_INT,    { .i64=1       },       0, INT_MAX, FLAGS },
+	{ "cond",                  "condition to toggle the indirect execution",                                                          OFFSET(cond_expr),             AV_OPT_TYPE_STRING, { .str="0"     },       0, 0,       FLAGS },
+	{ "vf",                    "set video filters.Exclusive with 'invoke'",                                                           OFFSET(vf_desc),               AV_OPT_TYPE_STRING, { .str=NULL    },       0, 0,       FLAGS },
+    { "invoke",                "indicate to use dynamic library to generate vf desc.filename:param1:param2...Exclusive with 'vf'",    OFFSET(invoke_cmd),            AV_OPT_TYPE_STRING, { .str=NULL    },       0, 0,       FLAGS },
+    { "invoke_stapar",         "indicate the initalize string param for dynamic library indicated by 'invoke'",                       OFFSET(invoke_stapar),         AV_OPT_TYPE_STRING, { .str=NULL    },       0, 0,       FLAGS },
+    { "invoke_provide_log",    "whether indirect would provide a log context for the dynamic library.You MUST CONFIRM that "
+                               "the ABI of ffmpeg compatity between the executor of this filter and the dynamic library if "
+                               "you want to set this to 1",                                                                           OFFSET(invoke_provide_log),    AV_OPT_TYPE_INT,    { .i64=0,      },       0, INT_MAX, FLAGS },
+    { "start_number",          "start frame number for n/frame_num variable",                                                         OFFSET(start_number),          AV_OPT_TYPE_INT,    { .i64=0       },       0, INT_MAX, FLAGS },
+	{ "wait_ioplaying",        "weather the execution of video filters depends on the readility of the context for ioplaying ",       OFFSET(wait_ioplaying),        AV_OPT_TYPE_INT,    { .i64=1       },       0, INT_MAX, FLAGS },
     { NULL }
 };
 

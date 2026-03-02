@@ -106,9 +106,12 @@ void sink2process(const std::string& cmd)
 }
 void go_ffplay(bool is_debug,double start_time,int window_height,const std::string& video_path,const std::string& video_filter)
 {
+    
     std::string cmd;
     if(is_debug)
-        cmd="gdb --args \"E:\\ffmpeg-custom\\ffplay_g.exe\" ";
+    {
+        cmd="gdb --args \"D:\\ffmpeg-custom\\FFmpeg\\ffplay_g.exe\" ";
+    }
     else
         cmd="ffplay ";
     
@@ -124,7 +127,7 @@ void go_ffplay(bool is_debug,double start_time,int window_height,const std::stri
 
 double get_start_time()
 {
-    return 6944;
+    return 1613.27;
 }
 std::string get_video_filter(double video_time)
 {
@@ -325,14 +328,15 @@ ioplaying=
 indirect=
     vf='
         drawbox=
-        t=fill:
-        x=$(metadata|progbar_x|1):
-        y=$(metadata|progbar_y|1):
-        w=$(metadata|progbar_w|1):
-        h=$(metadata|progbar_h|1):
-        color=0x66CCFF@0.2,
+            t=fill:
+            x=$(metadata|progbar_x|1):
+            y=$(metadata|progbar_y|1):
+            w=$(metadata|progbar_w|1):
+            h=$(metadata|progbar_h|1):
+            color=0x66CCFF@0.2,
     ':
-    cond='1',
+    cond='metadata(meta_info_show)',
+
 ioplaying=
     cond=all:
     out='metadata:frame_number_4_indirect'='%{{n}}',
@@ -358,11 +362,75 @@ indirect=
             boxcolor=black@0.5,
 
     ':
-    cond='metadata(meta_info_show)'
+    cond='metadata(meta_info_show)',
+
+ioplaying=
+    cond=all:
+    out='metadata:meta_is_mute'='%{{expr:is_mute}}',
+ioplaying=
+    cond=once:
+    out='var:volbar_max_w'='%{{expr:main_w*0.05}}',
+ioplaying=
+    cond=all:
+    out='metadata:volbar_w'='%{{expr:max(volbar_max_w*audio_volume,1)}}',
+ioplaying=
+    cond=all:
+    out='metadata:volbar_max_w'='%{{expr:volbar_max_w}}',
+indirect=
+    vf='
+        drawbox=
+            x=1:
+            y=$(expr|1+2*main_h*0.017):
+            w=$(metadata|volbar_max_w|1):
+            h=$(expr|main_h*0.017):
+            color=0x66CCFF@0.2,
+        drawbox=
+            t=fill:
+            x=1:
+            y=$(expr|1+2*main_h*0.017):
+            w=$(metadata|volbar_w|1):
+            h=$(expr|main_h*0.017):
+            color=0x66CCFF@0.2,
+    ':
+    cond='metadata(meta_info_show)',
+indirect=
+    vf='
+        drawtext=
+            text='\''静音'\'':
+            x=$(metadata|volbar_max_w|1)+5:
+            y=1+2*main_h*0.017:
+            fontsize=main_h*0.017:
+            fontcolor=red:
+            fontfile='\''C:/Windows/Fonts/simhei.ttf'\'':
+            box=1:
+            boxcolor=black@0.5,
+    ':
+    cond='metadata(meta_info_show)*metadata(meta_is_mute)',
+indirect=
+    invoke='D\:/ffg1/plg_mono.dll:$(metadata|mouse_x|lb_release)':
+    invoke_stapar=null:
+    cond=1,
+null,
+
 
 )+++",video_time);
 }
+/*
+indirect=
+    vf='
+        drawtext=
+            text='\''八千代小姐我是你的狗'\'':
+            x=1:
+            y=1+3*main_h*0.017:
+            fontsize=main_h*0.017:
+            fontcolor=white:
+            fontfile='\''C:/Windows/Fonts/simhei.ttf'\'':
+            box=1:
+            boxcolor=black@0.5,
+    ':
+    cond='1',
 
+*/
 
 
 
@@ -398,12 +466,6 @@ int main(int argc,char **argv)
     std::println("视频长度（秒数）：{}",video_secs);
     std::println("窗口高度：{}",window_height);
     std::println("是否Debug：{}",is_debug);
-    
-    std::string cmd;
-    if(is_debug)
-        cmd="gdb --args \"E:\\ffmpeg-custom\\ffplay_g.exe\" ";
-    else
-        cmd="ffplay ";
     
     double start_time=get_start_time();
 

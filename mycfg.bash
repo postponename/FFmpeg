@@ -1,8 +1,8 @@
-cd /e/ffmpeg-custom
+cd /d/ffmpeg-custom/FFmpeg
 
 ./configure \
   --logfile=configure.log \
-  --prefix=/e/ffmpeg-custom/build \
+  --prefix=/d/ffmpeg-custom/FFmpeg/build \
   --enable-gpl \
   --enable-version3 \
   --enable-ffmpeg \

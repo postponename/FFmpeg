@@ -104,16 +104,38 @@ typedef struct IOPlayingContext
     
 }IOPlayingContext;
 
+typedef void *(*InvokeInitFunc)(char *stapar,void *log_ctx);
+typedef void *(*InvokeUninitFunc)(void **opaque_ptr);
+typedef void *(*InvokeVFFunc)(void *opaque,int argc,char **argv,int *status);
+
+typedef struct
+{
+    const char *path;
+    void *lib;
+    void *opaque;
+    InvokeInitFunc init;
+    InvokeVFFunc vf;
+    InvokeUninitFunc uninit;
+    
+    void *log_ctx;
+}IndirectInvokeContext;
+
 typedef struct IndirectContext
 {
     const AVClass *class;
     
     char *cond_expr,*vf_desc;
+    char *invoke_cmd;
+    char *invoke_stapar;
+    int invoke_provide_log;
     int start_number;
     int wait_ioplaying;
     
+    const char *invoke_path,*invoke_param;
     AVBPrint expr_prep;
-    AVBPrint vf_desc_expand;
+    AVBPrint desc_cmd_expand;
+    
+    IndirectInvokeContext *invoke_ctx;
     
     IOPlayingGlobal ioplaying_global;
     PlaycallGlobal playcall_global;
