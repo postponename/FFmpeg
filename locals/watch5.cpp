@@ -407,10 +407,12 @@ indirect=
     ':
     cond='metadata(meta_info_show)*metadata(meta_is_mute)',
 indirect=
-    invoke='D\:/ffg1/plg_mono.dll:$(metadata|mouse_x|lb_release)':
-    invoke_stapar=null:
+    invoke='D\:/ffg1/plg_mono.dll:$(metadata|mouse_x|lb_release):aav:aarc:$(metadata|mouse_y|-1)':
+    invoke_stapar=indirect:
+    invoke_provide_log=1:
     cond=1,
 null,
+indirect=invoke=a.dll:vf=indirect:cond=1,
 
 
 )+++",video_time);

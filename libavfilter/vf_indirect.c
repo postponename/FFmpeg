@@ -41,7 +41,7 @@ static const char *indirect_invokee_item_name(void *ptr)
 
 const AVClass indirect_invokee_class=
 {
-    .class_name = "IndirectInvokee",
+    .class_name = "indirect:invokee",
     .item_name  = indirect_invokee_item_name,
     .version    = LIBAVUTIL_VERSION_INT,
     .category   = AV_CLASS_CATEGORY_FILTER,
@@ -59,45 +59,40 @@ static void *init_invoke_log_ctx(const char *path)
 static void uninit_invoke_log_ctx(void **ptr_ctx)
 {
     IndirectInvokeeLogCtx *ctx=*ptr_ctx;
-    
     av_bprint_finalize(&ctx->item_name,NULL);
     av_free(ctx);
     *ptr_ctx=NULL;
 }
 
-static IndirectInvokeContext *invoke_load(const char *path,char *stapar,int provide_log)
+static IndirectInvokeContext *invoke_load(const char *path,char *stapar,int provide_log,void *ind_log_ctx)
 {
     IndirectInvokeContext *ctx=(IndirectInvokeContext*)av_mallocz(sizeof(IndirectInvokeContext));
-    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
+    
     ctx->path=path;
     ctx->lib=dlopen(path,0);
     if(!ctx->lib)
     {
-        av_log(NULL,AV_LOG_ERROR,"failed to load dynamic library '%s'\n",path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"failed to load dynamic library '%s'\n",path);
         goto fail;
     }
-    av_log(NULL,AV_LOG_INFO,"ctx->lib:%p\n",ctx->lib);
     ctx->init=(InvokeInitFunc)dlsym(ctx->lib,"indirect_invoke_init");
     if(!ctx->init)
     {
-        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_init' from '%s'\n",path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"failed to load function 'indirect_invoke_init' from '%s'\n",path);
         goto fail;
     }
-    av_log(NULL,AV_LOG_INFO,"ctx->init:%p\n",(void*)ctx->init);
     ctx->vf=(InvokeVFFunc)dlsym(ctx->lib,"indirect_invoke_vf");
     if(!ctx->vf)
     {
-        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_vf' from '%s'\n",path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"failed to load function 'indirect_invoke_vf' from '%s'\n",path);
         goto fail;
     }
-    av_log(NULL,AV_LOG_INFO,"ctx->vf:%p\n",(void*)ctx->vf);
     ctx->uninit=(InvokeUninitFunc)dlsym(ctx->lib,"indirect_invoke_uninit");
     if(!ctx->uninit)
     {
-        av_log(NULL,AV_LOG_ERROR,"failed to load function 'indirect_invoke_uninit' from '%s'\n",path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"failed to load function 'indirect_invoke_uninit' from '%s'\n",path);
         goto fail;
     }
-    av_log(NULL,AV_LOG_INFO,"ctx->uninit:%p\n",(void*)ctx->uninit);
     
     if(provide_log)
         ctx->log_ctx=init_invoke_log_ctx(path);
@@ -107,10 +102,9 @@ static IndirectInvokeContext *invoke_load(const char *path,char *stapar,int prov
     ctx->opaque=ctx->init(stapar,ctx->log_ctx);
     if(!ctx->opaque)
     {
-        av_log(NULL,AV_LOG_ERROR,"failed to initialize dynamic library '%s'\n",path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"failed to initialize dynamic library '%s'\n",path);
         goto fail;
     }
-    av_log(NULL,AV_LOG_INFO,"ctx->opaque:%p,&ctx->opaque:%p\n",ctx->opaque,&ctx->opaque);
     return ctx;
 fail:
     if(!ctx)
@@ -123,30 +117,25 @@ fail:
     av_freep(&ctx);
     return NULL;
 }
-static const char *invoke_vf(IndirectInvokeContext *ctx,int argc,char **argv)
+static const char *invoke_vf(IndirectInvokeContext *ctx,int argc,char **argv,void *ind_log_ctx)
 {
-    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
     if(!ctx||!ctx->lib||!ctx->opaque||!ctx->vf)
         return NULL;
     int status=0;
     const char *vf=ctx->vf(ctx->opaque,argc,argv,&status);
-    av_log(NULL,AV_LOG_INFO,"vf:%s\n",vf);
-    av_log(NULL,AV_LOG_INFO,"status:%d\n",status);
     if(!status)
     {
-        av_log(NULL,AV_LOG_ERROR,"dynamic library '%s' failed to gnerate video filter desc\n",ctx->path);
+        av_log(ind_log_ctx,AV_LOG_ERROR,"dynamic library '%s' failed to gnerate video filter desc\n",ctx->path);
         return NULL;
     }
     return vf;
 }
-static void invoke_unload(IndirectInvokeContext **ctx_ptr)
+static void invoke_unload(IndirectInvokeContext **ctx_ptr,void *ind_log_ctx)
 {
     IndirectInvokeContext *ctx=*ctx_ptr;
-    av_log(NULL,AV_LOG_INFO,"ctx:%p\n",(void*)ctx);
     if(!ctx||!ctx->lib||!ctx->opaque||!ctx->uninit)
         return;
     ctx->uninit(&ctx->opaque);
-    av_log(NULL,AV_LOG_INFO,"ctx->opaque:%p,&ctx->opaque:%p\n",ctx->opaque,&ctx->opaque);
     dlclose(ctx->lib);
     ctx->lib=NULL;
     if(ctx->log_ctx)
@@ -202,11 +191,32 @@ static char *get_token_plain(const char **buf, const char *term)
     return small_ret ? small_ret : ret;
 }
 
+static void init_invoke(IndirectContext *indctx)
+{
+    if(!indctx->invoke_cmd)
+    {
+        indctx->invoke_ctx=NULL;
+        return;
+    }
+    const char *temp_cmd=indctx->invoke_cmd;
+    indctx->invoke_path=av_get_token(&temp_cmd,":");
+    temp_cmd++;//skip colomn
+    if(!*temp_cmd)
+        indctx->invoke_param=NULL;
+    else
+        indctx->invoke_param=get_token_plain(&temp_cmd,"");
+    indctx->invoke_ctx=invoke_load(indctx->invoke_path,indctx->invoke_stapar,indctx->invoke_provide_log,indctx);
+}
 
-
-
-
-
+static void uninit_invoke(IndirectContext *indctx)
+{
+    if(!indctx->invoke_cmd)
+        return;
+    av_freep(&indctx->invoke_path);
+    av_freep(&indctx->invoke_param);
+    if(indctx->invoke_ctx)
+        invoke_unload(&indctx->invoke_ctx,indctx);
+}
 
 static av_cold int init(AVFilterContext *ctx)
 {
@@ -217,21 +227,10 @@ static av_cold int init(AVFilterContext *ctx)
     av_bprint_init(&indctx->desc_cmd_expand,0,AV_BPRINT_SIZE_UNLIMITED);
     if(indctx->vf_desc&&indctx->invoke_cmd)
     {
-        av_log(indctx,AV_LOG_ERROR,"cannot indicate both 'vf' and 'invoke'\n");
+        av_log(indctx,AV_LOG_ERROR,"cannot indicate both 'vf'(='%s') and 'invoke'(='%s')\n",indctx->vf_desc,indctx->invoke_cmd);
+        return 0;
     }
-    if(indctx->invoke_cmd)
-    {
-        av_assert0(!indctx->vf_desc);
-        const char *temp_cmd=indctx->invoke_cmd;
-        indctx->invoke_path=av_get_token(&temp_cmd,":");
-        temp_cmd++;//skip colomn
-        if(!temp_cmd)
-            indctx->invoke_param=NULL;
-        else
-            indctx->invoke_param=get_token_plain(&temp_cmd,"");
-        av_log(indctx,AV_LOG_INFO,"%s0 %s\n",indctx->invoke_path,indctx->invoke_param);
-        indctx->invoke_ctx=invoke_load(indctx->invoke_path,indctx->invoke_stapar,indctx->invoke_provide_log);
-    }
+    init_invoke(indctx);
 	return 0;
 }
 static av_cold void uninit(AVFilterContext *ctx)
@@ -239,15 +238,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     IndirectContext *indctx = ctx->priv;
     av_bprint_finalize(&indctx->expr_prep,NULL);
     av_bprint_finalize(&indctx->desc_cmd_expand,NULL);
-    if(indctx->invoke_cmd)
-    {
-        av_freep(&indctx->invoke_path);
-        av_freep(&indctx->invoke_param);
-        invoke_unload(&indctx->invoke_ctx);
-    }
+    uninit_invoke(indctx);
 }
-
-
 
 static const enum AVPixelFormat pix_fmts[]=
 {
@@ -273,7 +265,6 @@ static const enum AVPixelFormat pix_fmts[]=
    
 	AV_PIX_FMT_NONE
 };
-
 
 static const char * expr_var_names[]=
 {
@@ -355,8 +346,6 @@ static void free_eval_context(indirect_expansion_context *ctx)
 {
     
 }
-
-
 
 static void expr_prep_metadata_call(void *c0,void *log_ctx,AVBPrint *bp,const char* func_name,const char *args)
 {
@@ -440,7 +429,7 @@ static void expa_func_strftime(void *c0,AVBPrint *bp,const char *name,char **arg
 static void expa_func_eval_expr(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
 static void expa_func_eval_expr_int_fmt(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
 static void expa_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int argc);
-static indirect_expansion_func_entry vfdesc_func_table[]=
+static indirect_expansion_func_entry expa_func_table[]=
 {
     {"pict_type",          expa_func_pict_type          },
     {"pts",                expa_func_pts                },
@@ -517,11 +506,11 @@ static void expa_func_if(void *c0,AVBPrint *bp,const char *name,char **argv,int 
 static void do_expand_function(indirect_expansion_context *ctx,AVBPrint *bp,char *name,char **argv,int argc)
 {    
     int func=-1;
-    int nb_out_func=FF_ARRAY_ELEMS(vfdesc_func_table);
+    int nb_out_func=FF_ARRAY_ELEMS(expa_func_table);
     
     for(int i=0;i<nb_out_func;i++)
     {
-        if(strcmp(vfdesc_func_table[i].name,name)==0)
+        if(strcmp(expa_func_table[i].name,name)==0)
         {
             func=i;
             break;
@@ -534,7 +523,7 @@ static void do_expand_function(indirect_expansion_context *ctx,AVBPrint *bp,char
         return;
     }
     
-    vfdesc_func_table[func].expand(ctx,bp,name,argv,argc);
+    expa_func_table[func].expand(ctx,bp,name,argv,argc);
 }
 
 
@@ -621,7 +610,7 @@ static const char *call_invoke_vf(indirect_expansion_context *ctx,IndirectInvoke
 {
     if(!param)
     {
-        return invoke_vf(ivk,0,NULL);
+        return invoke_vf(ivk,0,NULL,ctx->ind);
     }
     
     const char *result=NULL;
@@ -643,7 +632,7 @@ static const char *call_invoke_vf(indirect_expansion_context *ctx,IndirectInvoke
         expd++;
     }
     
-    result=invoke_vf(ivk,argc,argv);
+    result=invoke_vf(ivk,argc,argv,ctx->ind);
     
 end:
     for(int i=0;i<argc;i++)
@@ -820,7 +809,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if(indctx->wait_ioplaying&&!indirect_ioplaying_check(indctx))
     {
         av_log(indctx,AV_LOG_DEBUG,"context not initialized,do nothing\n");
-        return ff_filter_frame(ctx->outputs[0], frame);
+        return ff_filter_frame(ctx->outputs[0],frame);
     }
     
     indirect_expansion_context expd_ctx=
@@ -832,9 +821,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     };
     fill_eval_context(&expd_ctx);
     int cond=eval_condition(&expd_ctx);
-    if(!cond || (indctx->vf_desc&&indctx->invoke_cmd) )
+    if(!cond || (indctx->vf_desc&&indctx->invoke_cmd) || (!indctx->vf_desc&&!indctx->invoke_cmd))
     {
-        return ff_filter_frame(ctx->outputs[0], frame);
+        return ff_filter_frame(ctx->outputs[0],frame);
     }
     
     if(indctx->vf_desc)
@@ -846,8 +835,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     {
         const char *vfilter=call_invoke_vf(&expd_ctx,indctx->invoke_ctx,indctx->invoke_param);
         if(!vfilter)
-            return ff_filter_frame(ctx->outputs[0], frame);
-        av_log(indctx,AV_LOG_INFO,"get video filter from dynamic library : '%s'",vfilter);
+            return ff_filter_frame(ctx->outputs[0],frame);
         return execute_video_filter(inlink,frame,indctx,vfilter);
     }
     free_eval_context(&expd_ctx);
